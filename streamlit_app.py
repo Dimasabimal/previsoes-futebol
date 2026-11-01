@@ -671,6 +671,7 @@ def buscar_jogos(nome_liga):
 
 
 @st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=600, show_spinner=False)
 def buscar_classificacao(nome_liga):
     codigo = LIGAS[nome_liga]
     url = (
@@ -691,63 +692,381 @@ def buscar_classificacao(nome_liga):
     for bloco in r.json().get("standings", []):
         if bloco.get("type") not in ["TOTAL", None]:
             continue
+
         for linha in bloco.get("table", []):
             equipa = linha.get("team", {}).get("name")
             posicao = linha.get("position")
+
             if equipa and posicao:
                 posicoes[equipa] = int(posicao)
+
         if posicoes:
             break
 
     return posicoes
 
 
-def dificuldade_previsao(tipo, valor, jogo, posicoes):
-    # Para mercados que não representam diretamente a força de uma equipa,
-    # usamos dificuldade neutra.
-    if tipo not in ["resultado", "dupla_possibilidade"]:
+@st.cache_data(ttl=600, show_spinner=False)
+def buscar_perfil_golos_liga(nome_liga):
+    """
+    Usa jogos FINALIZADOS recentes da competição para criar
+    um perfil simples de golos de cada equipa.
+
+    Guardamos, para cada equipa, até aos 8 jogos mais recentes:
+    - golos marcados
+    - total de golos do jogo
+    - total de golos ao intervalo
+    - se ambas marcaram
+    """
+    codigo = LIGAS[nome_liga]
+
+    agora = datetime.now(TZ)
+    data_fim = agora.date()
+    data_inicio = (agora - timedelta(days=90)).date()
+
+    url = (
+        "https://api.football-data.org/v4/"
+        f"competitions/{codigo}/matches"
+        f"?dateFrom={data_inicio.isoformat()}"
+        f"&dateTo={data_fim.isoformat()}"
+        "&status=FINISHED"
+    )
+
+    headers = {"X-Auth-Token": FOOTBALL_API_KEY}
+
+    try:
+        r = requests.get(
+            url,
+            headers=headers,
+            timeout=20,
+        )
+    except requests.RequestException:
+        return {}
+
+    if r.status_code != 200:
+        return {}
+
+    perfis = defaultdict(list)
+
+    partidas = r.json().get("matches", [])
+
+    # Mais recentes primeiro.
+    partidas.sort(
+        key=lambda p: p.get("utcDate", ""),
+        reverse=True,
+    )
+
+    for partida in partidas:
+        casa = (
+            partida.get("homeTeam", {}).get("name")
+        )
+        fora = (
+            partida.get("awayTeam", {}).get("name")
+        )
+
+        if not casa or not fora:
+            continue
+
+        score = partida.get("score", {}) or {}
+
+        full = score.get("fullTime", {}) or {}
+        gc = full.get("home")
+        gf = full.get("away")
+
+        if gc is None or gf is None:
+            regular = score.get("regularTime", {}) or {}
+            gc = regular.get("home")
+            gf = regular.get("away")
+
+        if gc is None or gf is None:
+            continue
+
+        half = score.get("halfTime", {}) or {}
+        hc = half.get("home")
+        hf = half.get("away")
+
+        total = gc + gf
+        ambas = gc >= 1 and gf >= 1
+
+        total_intervalo = None
+        if hc is not None and hf is not None:
+            total_intervalo = hc + hf
+
+        registo_casa = {
+            "marcados": gc,
+            "total": total,
+            "intervalo_total": total_intervalo,
+            "ambas": ambas,
+        }
+
+        registo_fora = {
+            "marcados": gf,
+            "total": total,
+            "intervalo_total": total_intervalo,
+            "ambas": ambas,
+        }
+
+        if len(perfis[casa]) < 8:
+            perfis[casa].append(registo_casa)
+
+        if len(perfis[fora]) < 8:
+            perfis[fora].append(registo_fora)
+
+    return dict(perfis)
+
+
+def dificuldade_por_probabilidade(probabilidade):
+    """
+    Converte uma frequência estimada (0 a 1) em dificuldade.
+
+    70%+   -> Fácil x1
+    55-69% -> Média x1.5
+    35-54% -> Difícil x2
+    <35%   -> Muito difícil x3
+    """
+    if probabilidade is None:
+        return "Média", 1.5
+
+    if probabilidade >= 0.70:
         return "Fácil", 1.0
 
-    casa = jogo.get("casa")
-    fora = jogo.get("fora")
-    pc = posicoes.get(casa)
-    pf = posicoes.get(fora)
+    if probabilidade >= 0.55:
+        return "Média", 1.5
 
-    if tipo == "resultado" and valor == "Empate":
+    if probabilidade >= 0.35:
         return "Difícil", 2.0
 
-    if tipo == "dupla_possibilidade" and valor == "CasaFora":
-        return "Média", 1.5
+    return "Muito difícil", 3.0
 
-    # Se não houver classificação disponível, mantemos uma dificuldade neutra.
-    if not pc or not pf:
-        return "Média", 1.5
 
-    if tipo == "resultado":
-        if valor == "Casa":
+def frequencia_evento(lista, funcao):
+    valores = []
+
+    for item in lista:
+        try:
+            resultado = funcao(item)
+        except Exception:
+            resultado = None
+
+        if resultado is not None:
+            valores.append(1 if resultado else 0)
+
+    if not valores:
+        return None
+
+    return sum(valores) / len(valores)
+
+
+def media_probabilidades(*valores):
+    validos = [
+        valor
+        for valor in valores
+        if valor is not None
+    ]
+
+    if not validos:
+        return None
+
+    return sum(validos) / len(validos)
+
+
+def dificuldade_previsao(
+    tipo,
+    valor,
+    jogo,
+    posicoes,
+    perfis_golos=None,
+):
+    casa = jogo.get("casa")
+    fora = jogo.get("fora")
+
+    # =====================================================
+    # RESULTADO / DUPLA POSSIBILIDADE
+    # =====================================================
+
+    if tipo in [
+        "resultado",
+        "dupla_possibilidade",
+    ]:
+        pc = posicoes.get(casa)
+        pf = posicoes.get(fora)
+
+        if tipo == "resultado" and valor == "Empate":
+            return "Difícil", 2.0
+
+        if (
+            tipo == "dupla_possibilidade"
+            and valor == "CasaFora"
+        ):
+            return "Média", 1.5
+
+        if not pc or not pf:
+            return "Média", 1.5
+
+        if tipo == "resultado":
+            if valor == "Casa":
+                delta = pc - pf
+            else:
+                delta = pf - pc
+
+            if delta <= -5:
+                return "Fácil", 1.0
+
+            if delta <= 1:
+                return "Média", 1.5
+
+            if delta <= 6:
+                return "Difícil", 2.0
+
+            return "Muito difícil", 3.0
+
+        if valor == "CasaEmpate":
             delta = pc - pf
         else:
             delta = pf - pc
 
         if delta <= -5:
             return "Fácil", 1.0
-        if delta <= 1:
+
+        if delta <= 2:
             return "Média", 1.5
-        if delta <= 6:
-            return "Difícil", 2.0
-        return "Muito difícil", 3.0
 
-    # Dupla possibilidade: lado + empate.
-    if valor == "CasaEmpate":
-        delta = pc - pf
-    else:
-        delta = pf - pc
+        return "Difícil", 2.0
 
-    if delta <= -5:
-        return "Fácil", 1.0
-    if delta <= 2:
+    # =====================================================
+    # MERCADOS DE GOLOS
+    # =====================================================
+
+    perfis_golos = perfis_golos or {}
+
+    jogos_casa = perfis_golos.get(casa, [])
+    jogos_fora = perfis_golos.get(fora, [])
+
+    # Se ainda não houver amostra suficiente, usamos Médio,
+    # em vez de marcar tudo automaticamente como Fácil.
+    if not jogos_casa and not jogos_fora:
         return "Média", 1.5
-    return "Difícil", 2.0
+
+    if tipo == "ambas_marcam":
+        freq_casa = frequencia_evento(
+            jogos_casa,
+            lambda x: x.get("ambas"),
+        )
+
+        freq_fora = frequencia_evento(
+            jogos_fora,
+            lambda x: x.get("ambas"),
+        )
+
+        prob_sim = media_probabilidades(
+            freq_casa,
+            freq_fora,
+        )
+
+        if prob_sim is None:
+            return "Média", 1.5
+
+        prob = (
+            prob_sim
+            if valor == "Sim"
+            else 1 - prob_sim
+        )
+
+        return dificuldade_por_probabilidade(prob)
+
+    if tipo == "golos_tempo_regulamentar":
+        minimo = valor_minimo_golos(valor)
+
+        def evento_total(item):
+            total = item.get("total")
+
+            if total is None:
+                return None
+
+            if valor == "0":
+                return total == 0
+
+            return total >= minimo
+
+        freq_casa = frequencia_evento(
+            jogos_casa,
+            evento_total,
+        )
+
+        freq_fora = frequencia_evento(
+            jogos_fora,
+            evento_total,
+        )
+
+        return dificuldade_por_probabilidade(
+            media_probabilidades(
+                freq_casa,
+                freq_fora,
+            )
+        )
+
+    if tipo == "golos_intervalo":
+        minimo = valor_minimo_golos(valor)
+
+        def evento_intervalo(item):
+            total = item.get("intervalo_total")
+
+            if total is None:
+                return None
+
+            if valor == "0":
+                return total == 0
+
+            return total >= minimo
+
+        freq_casa = frequencia_evento(
+            jogos_casa,
+            evento_intervalo,
+        )
+
+        freq_fora = frequencia_evento(
+            jogos_fora,
+            evento_intervalo,
+        )
+
+        return dificuldade_por_probabilidade(
+            media_probabilidades(
+                freq_casa,
+                freq_fora,
+            )
+        )
+
+    if tipo in [
+        "golos_equipa_casa",
+        "golos_equipa_fora",
+    ]:
+        minimo = valor_minimo_golos(valor)
+
+        jogos_equipa = (
+            jogos_casa
+            if tipo == "golos_equipa_casa"
+            else jogos_fora
+        )
+
+        def evento_equipa(item):
+            marcados = item.get("marcados")
+
+            if marcados is None:
+                return None
+
+            if valor == "0":
+                return marcados == 0
+
+            return marcados >= minimo
+
+        prob = frequencia_evento(
+            jogos_equipa,
+            evento_equipa,
+        )
+
+        return dificuldade_por_probabilidade(prob)
+
+    return "Média", 1.5
 
 
 # =========================================================
@@ -1685,8 +2004,10 @@ with tab_prever:
     with st.spinner("A carregar jogos..."):
         jogos, erro = buscar_jogos(liga)
         classificacao_atual = buscar_classificacao(liga)
+        perfil_golos_atual = buscar_perfil_golos_liga(liga)
 
     st.session_state["classificacao"] = classificacao_atual
+    st.session_state["perfil_golos"] = perfil_golos_atual
 
     if erro:
         st.error(erro)
@@ -1798,8 +2119,14 @@ with tab_prever:
             )
 
             posicoes = st.session_state.get("classificacao", {})
+            perfis_golos = st.session_state.get("perfil_golos", {})
+
             dificuldade, multiplicador = dificuldade_previsao(
-                tipo, valor, jogo, posicoes
+                tipo,
+                valor,
+                jogo,
+                posicoes,
+                perfis_golos,
             )
 
             st.info(
