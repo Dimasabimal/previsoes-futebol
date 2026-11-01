@@ -5,6 +5,7 @@ import unicodedata
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from collections import defaultdict
+from streamlit_cookies_manager import EncryptedCookieManager
 
 # =========================================================
 # CONFIGURAÇÃO
@@ -20,6 +21,16 @@ SUPABASE_URL = st.secrets["SUPABASE_URL"].rstrip("/")
 SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
 SUPABASE_SECRET_KEY = st.secrets["SUPABASE_SECRET_KEY"]
 FOOTBALL_API_KEY = st.secrets["FOOTBALL_API_KEY"]
+
+# Cookie encriptado para manter a sessão iniciada entre visitas.
+# A chave privada do servidor é usada apenas como palavra-passe de encriptação.
+cookies = EncryptedCookieManager(
+    prefix="previsoes_futebol/",
+    password=SUPABASE_SECRET_KEY,
+)
+
+if not cookies.ready():
+    st.stop()
 
 TZ = ZoneInfo("Europe/Lisbon")
 
@@ -226,6 +237,27 @@ def melhor_liga(lista):
     return ranking[0][2] if ranking else "—"
 
 
+def equipa_associada_previsao(p):
+    """Devolve apenas a equipa realmente associada à previsão."""
+    tipo = p.get("tipo_previsao")
+    valor = p.get("valor_previsao")
+
+    if tipo == "resultado":
+        if valor == "Casa":
+            return p.get("casa")
+        if valor == "Fora":
+            return p.get("fora")
+        return None
+
+    if tipo == "golos_equipa_casa":
+        return p.get("equipa_previsao") or p.get("casa")
+
+    if tipo == "golos_equipa_fora":
+        return p.get("equipa_previsao") or p.get("fora")
+
+    return None
+
+
 def melhor_equipa(lista):
     grupos = defaultdict(list)
 
@@ -233,20 +265,16 @@ def melhor_equipa(lista):
         if p.get("resultado") not in ["Acertou", "Errou"]:
             continue
 
-        casa = p.get("casa")
-        fora = p.get("fora")
-
-        if casa:
-            grupos[casa].append(p)
-        if fora:
-            grupos[fora].append(p)
+        equipa = equipa_associada_previsao(p)
+        if equipa:
+            grupos[equipa].append(p)
 
     ranking = []
     for nome, itens in grupos.items():
         e = estatisticas_basicas(itens)
         ranking.append((e["taxa"], e["concluidas"], nome))
-    ranking.sort(reverse=True)
 
+    ranking.sort(reverse=True)
     return ranking[0][2] if ranking else "—"
 
 
@@ -305,10 +333,101 @@ def fazer_login(username, password):
         return None
 
 
+def fazer_refresh(refresh_token):
+    url = (
+        f"{SUPABASE_URL}/auth/v1/token"
+        "?grant_type=refresh_token"
+    )
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Content-Type": "application/json",
+    }
+    try:
+        return requests.post(
+            url,
+            headers=headers,
+            json={"refresh_token": refresh_token},
+            timeout=20,
+        )
+    except requests.RequestException:
+        return None
+
+
+def aplicar_sessao(dados, nome_fallback=None):
+    user = dados.get("user") or {}
+    metadata = user.get("user_metadata", {}) or {}
+
+    st.session_state["access_token"] = dados["access_token"]
+    st.session_state["expires_at"] = dados.get("expires_at")
+    st.session_state["user_id"] = user.get("id")
+    st.session_state["nome"] = (
+        metadata.get("nome")
+        or metadata.get("username")
+        or nome_fallback
+        or "Utilizador"
+    )
+
+    refresh_token = dados.get("refresh_token")
+    if refresh_token:
+        cookies["refresh_token"] = refresh_token
+        cookies.save()
+
+
+def tentar_restaurar_sessao():
+    if "access_token" in st.session_state:
+        return True
+
+    refresh_token = cookies.get("refresh_token")
+    if not refresh_token:
+        return False
+
+    r = fazer_refresh(refresh_token)
+
+    if r is not None and r.status_code == 200:
+        aplicar_sessao(r.json())
+        return True
+
+    if "refresh_token" in cookies:
+        del cookies["refresh_token"]
+        cookies.save()
+
+    return False
+
+
+def garantir_sessao_valida():
+    if "access_token" not in st.session_state:
+        return tentar_restaurar_sessao()
+
+    expires_at = st.session_state.get("expires_at")
+    if not expires_at:
+        return True
+
+    agora_ts = datetime.now(ZoneInfo("UTC")).timestamp()
+
+    # Renova dois minutos antes do fim do token de acesso.
+    if agora_ts < float(expires_at) - 120:
+        return True
+
+    refresh_token = cookies.get("refresh_token")
+    if not refresh_token:
+        return False
+
+    r = fazer_refresh(refresh_token)
+    if r is not None and r.status_code == 200:
+        aplicar_sessao(r.json())
+        return True
+
+    return False
+
+
 def terminar_sessao():
+    if "refresh_token" in cookies:
+        del cookies["refresh_token"]
+        cookies.save()
+
     for chave in list(st.session_state.keys()):
-        if chave not in []:
-            st.session_state.pop(chave, None)
+        st.session_state.pop(chave, None)
+
     st.rerun()
 
 
@@ -477,23 +596,6 @@ def buscar_jogos(nome_liga):
 
     return jogos[:40], None
 
-
-def buscar_jogos_todas_ligas():
-    todos = []
-    erros = []
-
-    for nome_liga in LIGAS:
-        jogos, erro = buscar_jogos(nome_liga)
-        if erro:
-            erros.append(f"{nome_liga}: {erro}")
-        else:
-            todos.extend(jogos)
-
-    todos.sort(
-        key=lambda j: parse_data_jogo(j["data"])
-        or datetime.max.replace(tzinfo=TZ)
-    )
-    return todos, erros
 
 
 # =========================================================
@@ -967,12 +1069,219 @@ def texto_previsao(tipo, valor, jogo):
     return str(valor)
 
 
+def linhas_desempenho_equipa(lista):
+    grupos = defaultdict(list)
+
+    for p in lista:
+        equipa = equipa_associada_previsao(p)
+        if equipa:
+            grupos[equipa].append(p)
+
+    linhas = []
+    for nome, itens in grupos.items():
+        e = estatisticas_basicas(itens)
+        if e["concluidas"] == 0:
+            continue
+        linhas.append({
+            "Equipa": nome,
+            "Taxa": f"{e['taxa']:.1f}%",
+            "Concluídas": e["concluidas"],
+            "Pontos": e["pontos"],
+            "_taxa": e["taxa"],
+        })
+
+    linhas.sort(
+        key=lambda x: (x["_taxa"], x["Concluídas"]),
+        reverse=True,
+    )
+
+    for x in linhas:
+        x.pop("_taxa", None)
+
+    return linhas
+
+
+def mostrar_estatisticas_completas(lista, prefixo=""):
+    stats = estatisticas_basicas(lista)
+    streak_atual, melhor_streak = sequencias(lista)
+
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1.metric("Previsões", stats["total"])
+    m2.metric("Acertos", stats["acertos"])
+    m3.metric("Erros", stats["erros"])
+    m4.metric("Pendentes", stats["pendentes"])
+    m5.metric("Taxa", f"{stats['taxa']:.1f}%")
+    m6.metric("Pontos", f"{stats['pontos']:+d}")
+
+    st.subheader("Resumo do perfil")
+    r1, r2, r3, r4, r5 = st.columns(5)
+    r1.metric("Melhor tipo", melhor_categoria(lista))
+    r2.metric("Melhor liga", melhor_liga(lista))
+    r3.metric("Melhor equipa", melhor_equipa(lista))
+    r4.metric("Sequência atual", streak_atual)
+    r5.metric("Melhor sequência", melhor_streak)
+
+    st.subheader("🧠 Desempenho por confiança")
+    linhas_conf = []
+    for nivel in range(5, 0, -1):
+        itens = [
+            p for p in lista
+            if int(p.get("confianca", 0) or 0) == nivel
+            and p.get("resultado") in ["Acertou", "Errou"]
+        ]
+        if not itens:
+            continue
+        e = estatisticas_basicas(itens)
+        linhas_conf.append({
+            "Confiança": f"{nivel}/5",
+            "Taxa de acerto": f"{e['taxa']:.1f}%",
+            "Acertos": e["acertos"],
+            "Concluídas": e["concluidas"],
+            "Pontos": e["pontos"],
+        })
+
+    if linhas_conf:
+        st.dataframe(linhas_conf, hide_index=True, use_container_width=True)
+    else:
+        st.info("Ainda sem previsões concluídas.")
+
+    st.subheader("🎯 Desempenho por tipo")
+    grupos_tipo = defaultdict(list)
+    for p in lista:
+        grupos_tipo[categoria_estatistica(p.get("tipo_previsao"))].append(p)
+
+    linhas_tipo = []
+    for nome, itens in grupos_tipo.items():
+        e = estatisticas_basicas(itens)
+        linhas_tipo.append({
+            "Tipo": nome,
+            "Taxa": f"{e['taxa']:.1f}%",
+            "Acertos": e["acertos"],
+            "Erros": e["erros"],
+            "Pendentes": e["pendentes"],
+            "Pontos": e["pontos"],
+            "_taxa": e["taxa"],
+        })
+    linhas_tipo.sort(key=lambda x: x["_taxa"], reverse=True)
+    for x in linhas_tipo:
+        x.pop("_taxa", None)
+    if linhas_tipo:
+        st.dataframe(linhas_tipo, hide_index=True, use_container_width=True)
+
+    st.subheader("🏟️ Desempenho por liga")
+    grupos_liga = defaultdict(list)
+    for p in lista:
+        grupos_liga[p.get("liga", "Sem liga")].append(p)
+
+    linhas_liga = []
+    for nome, itens in grupos_liga.items():
+        e = estatisticas_basicas(itens)
+        linhas_liga.append({
+            "Liga": nome,
+            "Taxa": f"{e['taxa']:.1f}%",
+            "Acertos": e["acertos"],
+            "Concluídas": e["concluidas"],
+            "Pontos": e["pontos"],
+            "_taxa": e["taxa"],
+        })
+    linhas_liga.sort(key=lambda x: x["_taxa"], reverse=True)
+    for x in linhas_liga:
+        x.pop("_taxa", None)
+    if linhas_liga:
+        st.dataframe(linhas_liga, hide_index=True, use_container_width=True)
+
+    st.subheader("👕 Desempenho por equipa")
+    linhas_equipa = linhas_desempenho_equipa(lista)
+    if linhas_equipa:
+        st.dataframe(
+            linhas_equipa[:15],
+            hide_index=True,
+            use_container_width=True,
+        )
+    else:
+        st.caption("Ainda não existem previsões suficientes associadas a uma equipa específica.")
+
+    st.subheader("📅 Histórico mensal")
+    meses = defaultdict(list)
+    for p in lista:
+        criado = parse_created_at(p.get("created_at"))
+        if criado:
+            meses[criado.strftime("%Y-%m")].append(p)
+
+    historico = []
+    for mes in sorted(meses):
+        e = estatisticas_basicas(meses[mes])
+        historico.append({
+            "Mês": mes,
+            "Taxa": e["taxa"],
+            "Pontos": e["pontos"],
+            "Concluídas": e["concluidas"],
+        })
+
+    if historico:
+        st.dataframe(
+            [
+                {
+                    "Mês": x["Mês"],
+                    "Taxa": f"{x['Taxa']:.1f}%",
+                    "Pontos": x["Pontos"],
+                    "Concluídas": x["Concluídas"],
+                }
+                for x in historico
+            ],
+            hide_index=True,
+            use_container_width=True,
+        )
+        st.line_chart({x["Mês"]: x["Taxa"] for x in historico})
+
+    st.subheader("⏱️ Forma recente")
+    agora = datetime.now(TZ)
+    for dias in [7, 30]:
+        itens = []
+        for p in lista:
+            criado = parse_created_at(p.get("created_at"))
+            if criado and criado >= agora - timedelta(days=dias):
+                itens.append(p)
+        e = estatisticas_basicas(itens)
+        st.write(
+            f"**Últimos {dias} dias:** "
+            f"{e['taxa']:.1f}% • {e['pontos']:+d} pontos • "
+            f"{e['concluidas']} concluídas"
+        )
+
+    st.subheader("🏅 Recordes pessoais")
+    melhor_mes = "—"
+    if historico:
+        info = max(historico, key=lambda x: (x["Taxa"], x["Concluídas"]))
+        melhor_mes = f"{info['Mês']} ({info['Taxa']:.1f}%)"
+
+    fins_semana = defaultdict(list)
+    for p in lista:
+        criado = parse_created_at(p.get("created_at"))
+        if criado and criado.weekday() in [5, 6]:
+            chave = (criado.isocalendar().year, criado.isocalendar().week)
+            fins_semana[chave].append(p)
+
+    melhor_fds = 0
+    for itens in fins_semana.values():
+        melhor_fds = max(melhor_fds, sum(calcular_pontos(p) for p in itens))
+
+    st.write(f"**Melhor sequência:** {melhor_streak}")
+    st.write(f"**Melhor mês:** {melhor_mes}")
+    st.write(f"**Melhor fim de semana:** {melhor_fds:+d} pontos")
+    st.write(f"**Melhor liga:** {melhor_liga(lista)}")
+    st.write(f"**Melhor categoria:** {melhor_categoria(lista)}")
+
+
 # =========================================================
 # INTERFACE — LOGIN
 # =========================================================
 
 st.title("⚽ Previsões de Futebol")
 st.caption("Jogo de previsões entre amigos.")
+
+# Recupera e renova automaticamente a sessão guardada no navegador.
+garantir_sessao_valida()
 
 if "access_token" not in st.session_state:
     tab_login, tab_criar = st.tabs([
@@ -1012,23 +1321,9 @@ if "access_token" not in st.session_state:
                     dados = r.json()
                     user = dados["user"]
 
-                    st.session_state[
-                        "access_token"
-                    ] = dados["access_token"]
-
-                    st.session_state[
-                        "user_id"
-                    ] = user["id"]
-
-                    metadata = user.get(
-                        "user_metadata", {}
-                    )
-
-                    st.session_state["nome"] = (
-                        metadata.get(
-                            "nome",
-                            username_login,
-                        )
+                    aplicar_sessao(
+                        dados,
+                        nome_fallback=username_login,
                     )
                     st.rerun()
                 else:
@@ -1085,18 +1380,10 @@ if "access_token" not in st.session_state:
                     dados = r.json()
 
                     if dados.get("access_token"):
-                        st.session_state[
-                            "access_token"
-                        ] = dados["access_token"]
-
-                        st.session_state[
-                            "user_id"
-                        ] = dados["user"]["id"]
-
-                        st.session_state[
-                            "nome"
-                        ] = novo_username.strip()
-
+                        aplicar_sessao(
+                            dados,
+                            nome_fallback=novo_username.strip(),
+                        )
                         st.rerun()
                     else:
                         st.success(
@@ -1147,10 +1434,11 @@ minhas = [
 # TABS PRINCIPAIS
 # =========================================================
 
-tab_prever, tab_minhas, tab_stats, tab_ranking, tab_perfis = st.tabs([
+tab_prever, tab_minhas, tab_stats, tab_historico, tab_ranking, tab_perfis = st.tabs([
     "⚽ Prever",
     "📋 Minhas previsões",
     "📊 Estatísticas",
+    "📜 Histórico",
     "🏆 Ranking",
     "👥 Perfis",
 ])
@@ -1162,51 +1450,6 @@ tab_prever, tab_minhas, tab_stats, tab_ranking, tab_perfis = st.tabs([
 
 with tab_prever:
 
-    st.subheader("Jogos de hoje e amanhã")
-
-    if st.button(
-        "Carregar jogos de hoje/amanhã",
-        key="carregar_rapidos",
-    ):
-        with st.spinner(
-            "A carregar jogos..."
-        ):
-            todos, erros_api = (
-                buscar_jogos_todas_ligas()
-            )
-
-        hoje = datetime.now(TZ).date()
-        amanha = hoje + timedelta(days=1)
-
-        rapidos = [
-            j for j in todos
-            if parse_data_jogo(j["data"]).date()
-            in [hoje, amanha]
-        ]
-
-        st.session_state[
-            "jogos_rapidos"
-        ] = rapidos
-
-    rapidos = st.session_state.get(
-        "jogos_rapidos", []
-    )
-
-    if rapidos:
-        st.dataframe(
-            [
-                {
-                    "Data": j["data"],
-                    "Liga": j["liga"],
-                    "Jogo": j["jogo"],
-                }
-                for j in rapidos
-            ],
-            hide_index=True,
-            use_container_width=True,
-        )
-
-    st.divider()
     st.subheader("Nova previsão")
 
     liga = st.selectbox(
@@ -1820,377 +2063,90 @@ with tab_minhas:
 # =========================================================
 
 with tab_stats:
+    mostrar_estatisticas_completas(minhas, prefixo="minhas")
 
-    stats = estatisticas_basicas(minhas)
-    streak_atual, melhor_streak = sequencias(
-        minhas
-    )
 
-    m1, m2, m3, m4, m5, m6 = st.columns(6)
+# =========================================================
+# TAB — HISTÓRICO DOS ÚLTIMOS 7 DIAS
+# =========================================================
 
-    m1.metric(
-        "Previsões",
-        stats["total"],
-    )
-    m2.metric(
-        "Acertos",
-        stats["acertos"],
-    )
-    m3.metric(
-        "Erros",
-        stats["erros"],
-    )
-    m4.metric(
-        "Pendentes",
-        stats["pendentes"],
-    )
-    m5.metric(
-        "Taxa",
-        f"{stats['taxa']:.1f}%",
-    )
-    m6.metric(
-        "Pontos",
-        f"{stats['pontos']:+d}",
-    )
+with tab_historico:
+    st.subheader("📜 Histórico dos últimos 7 dias")
+    st.caption("Todos podem consultar o histórico recente dos participantes.")
 
-    st.subheader("Resumo do perfil")
+    nomes_historico = sorted({
+        p.get("utilizador")
+        for p in previsoes
+        if p.get("utilizador")
+    })
 
-    r1, r2, r3, r4, r5 = st.columns(5)
-
-    r1.metric(
-        "Melhor tipo",
-        melhor_categoria(minhas),
-    )
-    r2.metric(
-        "Melhor liga",
-        melhor_liga(minhas),
-    )
-    r3.metric(
-        "Melhor equipa",
-        melhor_equipa(minhas),
-    )
-    r4.metric(
-        "Sequência atual",
-        streak_atual,
-    )
-    r5.metric(
-        "Melhor sequência",
-        melhor_streak,
-    )
-
-    st.subheader(
-        "🧠 Desempenho por confiança"
-    )
-
-    linhas_conf = []
-
-    for nivel in range(5, 0, -1):
-        itens = [
-            p for p in minhas
-            if int(
-                p.get("confianca", 0) or 0
-            ) == nivel
-            and p.get("resultado")
-            in ["Acertou", "Errou"]
-        ]
-
-        if not itens:
-            continue
-
-        e = estatisticas_basicas(itens)
-
-        linhas_conf.append({
-            "Confiança": f"{nivel}/5",
-            "Taxa de acerto":
-                f"{e['taxa']:.1f}%",
-            "Acertos": e["acertos"],
-            "Concluídas": e["concluidas"],
-            "Pontos": e["pontos"],
-        })
-
-    if linhas_conf:
-        st.dataframe(
-            linhas_conf,
-            hide_index=True,
-            use_container_width=True,
-        )
+    if not nomes_historico:
+        st.info("Ainda não existem previsões no histórico.")
     else:
-        st.info(
-            "Ainda sem previsões concluídas."
+        nome_historico = st.selectbox(
+            "Escolhe um utilizador",
+            nomes_historico,
+            key="historico_utilizador",
         )
 
-    st.subheader(
-        "🎯 Desempenho por tipo"
-    )
+        agora = datetime.now(TZ)
+        inicio = agora - timedelta(days=7)
 
-    grupos_tipo = defaultdict(list)
+        historico_recente = []
+        for p in previsoes:
+            if p.get("utilizador") != nome_historico:
+                continue
 
-    for p in minhas:
-        grupos_tipo[
-            categoria_estatistica(
-                p.get("tipo_previsao")
-            )
-        ].append(p)
+            data_jogo = parse_data_jogo(p.get("data"))
+            if data_jogo and inicio <= data_jogo <= agora:
+                historico_recente.append(p)
 
-    linhas_tipo = []
-
-    for nome, itens in grupos_tipo.items():
-        e = estatisticas_basicas(itens)
-
-        linhas_tipo.append({
-            "Tipo": nome,
-            "Taxa": f"{e['taxa']:.1f}%",
-            "Acertos": e["acertos"],
-            "Erros": e["erros"],
-            "Pendentes": e["pendentes"],
-            "Pontos": e["pontos"],
-            "_taxa": e["taxa"],
-        })
-
-    linhas_tipo.sort(
-        key=lambda x: x["_taxa"],
-        reverse=True,
-    )
-
-    for x in linhas_tipo:
-        x.pop("_taxa", None)
-
-    if linhas_tipo:
-        st.dataframe(
-            linhas_tipo,
-            hide_index=True,
-            use_container_width=True,
+        historico_recente.sort(
+            key=lambda p: parse_data_jogo(p.get("data"))
+            or datetime.min.replace(tzinfo=TZ),
+            reverse=True,
         )
 
-    st.subheader("🏟️ Desempenho por liga")
+        if not historico_recente:
+            st.info("Este utilizador não tem jogos previstos nos últimos 7 dias.")
+        else:
+            resumo = estatisticas_basicas(historico_recente)
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Previsões", resumo["total"])
+            c2.metric("Acertos", resumo["acertos"])
+            c3.metric("Taxa", f"{resumo['taxa']:.1f}%")
+            c4.metric("Pontos", f"{resumo['pontos']:+d}")
 
-    grupos_liga = defaultdict(list)
+            grupos_hist = defaultdict(list)
+            for p in historico_recente:
+                grupos_hist[p.get("match_id")].append(p)
 
-    for p in minhas:
-        grupos_liga[
-            p.get("liga", "Sem liga")
-        ].append(p)
+            for _, lista in grupos_hist.items():
+                primeira = lista[0]
+                with st.expander(
+                    f"{primeira.get('data', '')} — {primeira.get('jogo', '')}"
+                ):
+                    st.caption(primeira.get("liga", ""))
 
-    linhas_liga = []
+                    for p in lista:
+                        estado = p.get("resultado", "Pendente")
+                        icone = {
+                            "Acertou": "✅",
+                            "Errou": "❌",
+                            "Pendente": "⏳",
+                        }.get(estado, "⏳")
 
-    for nome, itens in grupos_liga.items():
-        e = estatisticas_basicas(itens)
-
-        linhas_liga.append({
-            "Liga": nome,
-            "Taxa": f"{e['taxa']:.1f}%",
-            "Acertos": e["acertos"],
-            "Concluídas": e["concluidas"],
-            "Pontos": e["pontos"],
-            "_taxa": e["taxa"],
-        })
-
-    linhas_liga.sort(
-        key=lambda x: x["_taxa"],
-        reverse=True,
-    )
-
-    for x in linhas_liga:
-        x.pop("_taxa", None)
-
-    if linhas_liga:
-        st.dataframe(
-            linhas_liga,
-            hide_index=True,
-            use_container_width=True,
-        )
-
-    st.subheader("👕 Desempenho por equipa")
-
-    grupos_equipa = defaultdict(list)
-
-    for p in minhas:
-        if p.get("casa"):
-            grupos_equipa[
-                p["casa"]
-            ].append(p)
-        if p.get("fora"):
-            grupos_equipa[
-                p["fora"]
-            ].append(p)
-
-    linhas_equipa = []
-
-    for nome, itens in grupos_equipa.items():
-        e = estatisticas_basicas(itens)
-
-        if e["concluidas"] == 0:
-            continue
-
-        linhas_equipa.append({
-            "Equipa": nome,
-            "Taxa": f"{e['taxa']:.1f}%",
-            "Concluídas": e["concluidas"],
-            "Pontos": e["pontos"],
-            "_taxa": e["taxa"],
-        })
-
-    linhas_equipa.sort(
-        key=lambda x: (
-            x["_taxa"],
-            x["Concluídas"],
-        ),
-        reverse=True,
-    )
-
-    for x in linhas_equipa[:15]:
-        x.pop("_taxa", None)
-
-    if linhas_equipa:
-        st.dataframe(
-            linhas_equipa[:15],
-            hide_index=True,
-            use_container_width=True,
-        )
-
-    st.subheader(
-        "📅 Histórico mensal"
-    )
-
-    meses = defaultdict(list)
-
-    for p in minhas:
-        criado = parse_created_at(
-            p.get("created_at")
-        )
-        if criado:
-            meses[
-                criado.strftime("%Y-%m")
-            ].append(p)
-
-    historico = []
-
-    for mes in sorted(meses):
-        e = estatisticas_basicas(
-            meses[mes]
-        )
-        historico.append({
-            "Mês": mes,
-            "Taxa": e["taxa"],
-            "Pontos": e["pontos"],
-            "Concluídas": e["concluidas"],
-        })
-
-    if historico:
-        st.dataframe(
-            [
-                {
-                    "Mês": x["Mês"],
-                    "Taxa":
-                        f"{x['Taxa']:.1f}%",
-                    "Pontos":
-                        x["Pontos"],
-                    "Concluídas":
-                        x["Concluídas"],
-                }
-                for x in historico
-            ],
-            hide_index=True,
-            use_container_width=True,
-        )
-
-        st.line_chart(
-            {
-                x["Mês"]: x["Taxa"]
-                for x in historico
-            }
-        )
-
-    st.subheader(
-        "⏱️ Forma recente"
-    )
-
-    agora = datetime.now(TZ)
-
-    for dias in [7, 30]:
-        itens = [
-            p for p in minhas
-            if (
-                parse_created_at(
-                    p.get("created_at")
-                )
-                and
-                parse_created_at(
-                    p.get("created_at")
-                )
-                >= agora - timedelta(days=dias)
-            )
-        ]
-
-        e = estatisticas_basicas(itens)
-
-        st.write(
-            f"**Últimos {dias} dias:** "
-            f"{e['taxa']:.1f}% • "
-            f"{e['pontos']:+d} pontos • "
-            f"{e['concluidas']} concluídas"
-        )
-
-    st.subheader("🏅 Recordes pessoais")
-
-    melhor_mes = "—"
-    if historico:
-        melhor_mes_info = max(
-            historico,
-            key=lambda x: (
-                x["Taxa"],
-                x["Concluídas"],
-            ),
-        )
-        melhor_mes = (
-            f"{melhor_mes_info['Mês']} "
-            f"({melhor_mes_info['Taxa']:.1f}%)"
-        )
-
-    fins_semana = defaultdict(list)
-
-    for p in minhas:
-        criado = parse_created_at(
-            p.get("created_at")
-        )
-        if criado and criado.weekday() in [5, 6]:
-            chave = (
-                criado.isocalendar().year,
-                criado.isocalendar().week,
-            )
-            fins_semana[chave].append(p)
-
-    melhor_fds = 0
-
-    for itens in fins_semana.values():
-        melhor_fds = max(
-            melhor_fds,
-            sum(
-                calcular_pontos(p)
-                for p in itens
-            ),
-        )
-
-    st.write(
-        f"**Melhor sequência:** "
-        f"{melhor_streak}"
-    )
-    st.write(
-        f"**Melhor mês:** "
-        f"{melhor_mes}"
-    )
-    st.write(
-        f"**Melhor fim de semana:** "
-        f"{melhor_fds:+d} pontos"
-    )
-    st.write(
-        f"**Melhor liga:** "
-        f"{melhor_liga(minhas)}"
-    )
-    st.write(
-        f"**Melhor categoria:** "
-        f"{melhor_categoria(minhas)}"
-    )
+                        st.write(
+                            f"**{icone} {categoria_estatistica(p.get('tipo_previsao'))}**"
+                        )
+                        st.write(f"Previsão: {p.get('previsao', '')}")
+                        st.write(f"Confiança: {p.get('confianca', '')}/5")
+                        st.write(f"Resultado: {estado}")
+                        if estado != "Pendente":
+                            st.write(f"Pontos: {calcular_pontos(p):+d}")
+                        if p.get("placar"):
+                            st.write(f"Placar: {p.get('placar')}")
+                        st.divider()
 
 
 # =========================================================
@@ -2198,201 +2154,122 @@ with tab_stats:
 # =========================================================
 
 with tab_ranking:
-
     grupos_amigos = defaultdict(list)
-
     for p in previsoes:
-        grupos_amigos[
-            p.get(
-                "utilizador",
-                "Sem nome",
-            )
-        ].append(p)
+        grupos_amigos[p.get("utilizador", "Sem nome")].append(p)
 
-    ranking_precisao = []
+    elegiveis = []
     insuficientes = []
 
     for nome, itens in grupos_amigos.items():
         e = estatisticas_basicas(itens)
-
-        linha = {
-            "nome": nome,
-            **e,
-        }
-
-        if (
-            e["concluidas"]
-            >= MINIMO_RANKING_PRECISAO
-        ):
-            ranking_precisao.append(
-                linha
-            )
+        linha = {"nome": nome, **e}
+        if e["concluidas"] >= MINIMO_RANKING_PRECISAO:
+            elegiveis.append(linha)
         else:
-            insuficientes.append(
-                linha
-            )
+            insuficientes.append(linha)
 
-    ranking_precisao.sort(
-        key=lambda x: (
-            x["taxa"],
-            x["concluidas"],
-        ),
+    elegiveis.sort(
+        key=lambda x: (x["taxa"], x["concluidas"], x["acertos"]),
+        reverse=True,
+    )
+    insuficientes.sort(
+        key=lambda x: (x["taxa"], x["concluidas"]),
         reverse=True,
     )
 
-    st.subheader(
-        "🏆 Ranking por precisão"
-    )
+    st.subheader("🏆 Ranking por precisão")
+    tabela_precisao = []
 
-    if ranking_precisao:
-        for pos, pessoa in enumerate(
-            ranking_precisao,
-            start=1,
-        ):
-            medalha = (
-                "🥇"
-                if pos == 1
-                else "🥈"
-                if pos == 2
-                else "🥉"
-                if pos == 3
-                else f"{pos}º"
-            )
+    for pos, pessoa in enumerate(elegiveis, start=1):
+        tabela_precisao.append({
+            "Posição": pos,
+            "Utilizador": pessoa["nome"],
+            "Precisão": f"{pessoa['taxa']:.1f}%",
+            "Acertos": pessoa["acertos"],
+            "Concluídas": pessoa["concluidas"],
+            "Estado": "Ranking",
+        })
 
-            st.write(
-                f"### {medalha} "
-                f"{pessoa['nome']} — "
-                f"{pessoa['taxa']:.1f}%"
-            )
+    for pessoa in insuficientes:
+        tabela_precisao.append({
+            "Posição": "—",
+            "Utilizador": pessoa["nome"],
+            "Precisão": f"{pessoa['taxa']:.1f}%",
+            "Acertos": pessoa["acertos"],
+            "Concluídas": pessoa["concluidas"],
+            "Estado": f"Amostra insuficiente (<{MINIMO_RANKING_PRECISAO})",
+        })
 
-            st.caption(
-                f"{pessoa['acertos']} acertos "
-                f"em {pessoa['concluidas']} "
-                "previsões concluídas"
-            )
+    if tabela_precisao:
+        st.dataframe(
+            tabela_precisao,
+            hide_index=True,
+            use_container_width=True,
+        )
     else:
-        st.info(
-            "Ainda ninguém atingiu "
-            f"{MINIMO_RANKING_PRECISAO} "
-            "previsões concluídas."
-        )
+        st.info("Ainda não existem previsões concluídas.")
 
-    if insuficientes:
-        st.write(
-            "**Amostra insuficiente:**"
-        )
-
-        for pessoa in sorted(
-            insuficientes,
-            key=lambda x: x["taxa"],
-            reverse=True,
-        ):
-            st.write(
-                f"{pessoa['nome']} — "
-                f"{pessoa['taxa']:.1f}% "
-                f"({pessoa['concluidas']} concluídas)"
-            )
-
-    st.divider()
-    st.subheader(
-        "⭐ Ranking por pontos"
-    )
-
+    st.subheader("⭐ Ranking por pontos")
     ranking_pontos = []
 
     for nome, itens in grupos_amigos.items():
         e = estatisticas_basicas(itens)
-        ranking_pontos.append({
-            "nome": nome,
-            **e,
-        })
+        ranking_pontos.append({"nome": nome, **e})
 
     ranking_pontos.sort(
-        key=lambda x: (
-            x["pontos"],
-            x["acertos"],
-        ),
+        key=lambda x: (x["pontos"], x["acertos"], x["taxa"]),
         reverse=True,
     )
 
-    for pos, pessoa in enumerate(
-        ranking_pontos,
-        start=1,
-    ):
-        medalha = (
-            "🥇"
-            if pos == 1
-            else "🥈"
-            if pos == 2
-            else "🥉"
-            if pos == 3
-            else f"{pos}º"
+    tabela_pontos = []
+    for pos, pessoa in enumerate(ranking_pontos, start=1):
+        tabela_pontos.append({
+            "Posição": pos,
+            "Utilizador": pessoa["nome"],
+            "Pontos": pessoa["pontos"],
+            "Acertos": pessoa["acertos"],
+            "Erros": pessoa["erros"],
+        })
+
+    if tabela_pontos:
+        st.dataframe(
+            tabela_pontos,
+            hide_index=True,
+            use_container_width=True,
         )
 
-        st.write(
-            f"### {medalha} "
-            f"{pessoa['nome']} — "
-            f"{pessoa['pontos']:+d} pontos"
-        )
-
-        st.caption(
-            f"{pessoa['acertos']} acertos • "
-            f"{pessoa['erros']} erros"
-        )
-
-    st.divider()
-    st.subheader(
-        "🥇 Melhor por categoria"
-    )
+    st.subheader("🥇 Melhor por categoria")
 
     categorias = sorted({
-        categoria_estatistica(
-            p.get("tipo_previsao")
-        )
+        categoria_estatistica(p.get("tipo_previsao"))
         for p in previsoes
         if p.get("tipo_previsao")
     })
 
     linhas_categoria = []
-
     for categoria in categorias:
         melhor = None
 
         for nome, itens in grupos_amigos.items():
             filtrados = [
                 p for p in itens
-                if categoria_estatistica(
-                    p.get("tipo_previsao")
-                ) == categoria
+                if categoria_estatistica(p.get("tipo_previsao")) == categoria
             ]
-
-            e = estatisticas_basicas(
-                filtrados
-            )
-
+            e = estatisticas_basicas(filtrados)
             if e["concluidas"] == 0:
                 continue
 
-            candidato = (
-                e["taxa"],
-                e["concluidas"],
-                nome,
-            )
-
-            if (
-                melhor is None
-                or candidato > melhor
-            ):
+            candidato = (e["taxa"], e["concluidas"], nome)
+            if melhor is None or candidato > melhor:
                 melhor = candidato
 
         if melhor:
             linhas_categoria.append({
                 "Categoria": categoria,
                 "Melhor": melhor[2],
-                "Taxa":
-                    f"{melhor[0]:.1f}%",
-                "Concluídas":
-                    melhor[1],
+                "Taxa": f"{melhor[0]:.1f}%",
+                "Concluídas": melhor[1],
             })
 
     if linhas_categoria:
@@ -2408,7 +2285,6 @@ with tab_ranking:
 # =========================================================
 
 with tab_perfis:
-
     nomes = sorted({
         p.get("utilizador")
         for p in previsoes
@@ -2416,111 +2292,22 @@ with tab_perfis:
     })
 
     if not nomes:
-        st.info(
-            "Ainda não existem perfis."
-        )
+        st.info("Ainda não existem perfis.")
     else:
         nome_escolhido = st.selectbox(
             "Escolhe um amigo",
             nomes,
+            key="perfil_amigo",
         )
 
         perfil = [
             p for p in previsoes
-            if p.get("utilizador")
-            == nome_escolhido
+            if p.get("utilizador") == nome_escolhido
         ]
 
-        e = estatisticas_basicas(
-            perfil
+        st.subheader(f"👤 {nome_escolhido}")
+        mostrar_estatisticas_completas(
+            perfil,
+            prefixo=f"perfil_{nome_escolhido}",
         )
 
-        st.subheader(
-            f"👤 {nome_escolhido}"
-        )
-
-        p1, p2, p3, p4 = st.columns(4)
-
-        p1.metric(
-            "Taxa",
-            f"{e['taxa']:.1f}%",
-        )
-        p2.metric(
-            "Pontos",
-            f"{e['pontos']:+d}",
-        )
-        p3.metric(
-            "Acertos",
-            e["acertos"],
-        )
-        p4.metric(
-            "Concluídas",
-            e["concluidas"],
-        )
-
-        streak, best_streak = sequencias(
-            perfil
-        )
-
-        st.write(
-            f"**Melhor tipo:** "
-            f"{melhor_categoria(perfil)}"
-        )
-        st.write(
-            f"**Melhor liga:** "
-            f"{melhor_liga(perfil)}"
-        )
-        st.write(
-            f"**Melhor equipa:** "
-            f"{melhor_equipa(perfil)}"
-        )
-        st.write(
-            f"**Sequência atual:** "
-            f"{streak}"
-        )
-        st.write(
-            f"**Melhor sequência:** "
-            f"{best_streak}"
-        )
-
-        st.subheader(
-            "Confiança"
-        )
-
-        linhas = []
-
-        for nivel in range(5, 0, -1):
-            itens = [
-                p for p in perfil
-                if int(
-                    p.get("confianca", 0)
-                    or 0
-                ) == nivel
-                and p.get("resultado")
-                in ["Acertou", "Errou"]
-            ]
-
-            if not itens:
-                continue
-
-            s = estatisticas_basicas(
-                itens
-            )
-
-            linhas.append({
-                "Confiança":
-                    f"{nivel}/5",
-                "Taxa":
-                    f"{s['taxa']:.1f}%",
-                "Concluídas":
-                    s["concluidas"],
-                "Pontos":
-                    s["pontos"],
-            })
-
-        if linhas:
-            st.dataframe(
-                linhas,
-                hide_index=True,
-                use_container_width=True,
-            )
