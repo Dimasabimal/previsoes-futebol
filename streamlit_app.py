@@ -21,6 +21,7 @@ SUPABASE_URL = st.secrets["SUPABASE_URL"].rstrip("/")
 SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
 SUPABASE_SECRET_KEY = st.secrets["SUPABASE_SECRET_KEY"]
 FOOTBALL_API_KEY = st.secrets["FOOTBALL_API_KEY"]
+API_FOOTBALL_KEY = st.secrets.get("API_FOOTBALL_KEY", "")
 
 # Cookie encriptado para manter a sessão iniciada entre visitas.
 # A chave privada do servidor é usada apenas como palavra-passe de encriptação.
@@ -41,6 +42,7 @@ LIGAS = {
     "Serie A": "SA",
     "Bundesliga": "BL1",
     "Champions League": "CL",
+    "Brasileirão Série A": "API_FOOTBALL_BR",
 }
 
 NOMES_TIPOS = {
@@ -573,8 +575,314 @@ def apagar_previsao_utilizador(previsao_id):
 # API DE FUTEBOL
 # =========================================================
 
+
+def fonte_api_liga(nome_liga):
+    if nome_liga == "Brasileirão Série A":
+        return "api_football"
+    return "football_data"
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def obter_brasileirao_api_info():
+    """
+    Descobre o ID da Serie A do Brasil na API-Football para a época atual.
+    O ID é estável, mas fazer a descoberta uma vez por dia evita hardcode
+    e deixa a integração mais robusta.
+    """
+    if not API_FOOTBALL_KEY:
+        return None, None, "API_FOOTBALL_KEY não configurada."
+
+    temporada = datetime.now(TZ).year
+
+    url = "https://v3.football.api-sports.io/leagues"
+    headers = {
+        "x-apisports-key": API_FOOTBALL_KEY,
+    }
+    params = {
+        "country": "Brazil",
+        "season": temporada,
+        "search": "Serie A",
+    }
+
+    try:
+        r = requests.get(
+            url,
+            headers=headers,
+            params=params,
+            timeout=20,
+        )
+    except requests.RequestException as erro:
+        return None, None, f"Erro de ligação à API-Football: {erro}"
+
+    if r.status_code != 200:
+        return None, None, f"Erro API-Football: {r.status_code}"
+
+    dados = r.json()
+
+    if dados.get("errors"):
+        return None, None, f"API-Football: {dados['errors']}"
+
+    respostas = dados.get("response", [])
+
+    for item in respostas:
+        liga = item.get("league", {})
+        pais = item.get("country", {})
+
+        if (
+            liga.get("name") == "Serie A"
+            and pais.get("name") == "Brazil"
+        ):
+            return liga.get("id"), temporada, None
+
+    return None, None, (
+        "Não encontrei a Serie A do Brasil "
+        f"para a época {temporada} na API-Football."
+    )
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def buscar_jogos_brasileirao():
+    league_id, temporada, erro = obter_brasileirao_api_info()
+
+    if erro:
+        return [], erro
+
+    agora = datetime.now(TZ)
+    data_inicio = agora.date()
+    data_fim = (agora + timedelta(days=45)).date()
+
+    url = "https://v3.football.api-sports.io/fixtures"
+    headers = {
+        "x-apisports-key": API_FOOTBALL_KEY,
+    }
+    params = {
+        "league": league_id,
+        "season": temporada,
+        "from": data_inicio.isoformat(),
+        "to": data_fim.isoformat(),
+        "timezone": "Europe/Lisbon",
+    }
+
+    try:
+        r = requests.get(
+            url,
+            headers=headers,
+            params=params,
+            timeout=20,
+        )
+    except requests.RequestException as erro_req:
+        return [], f"Erro de ligação à API-Football: {erro_req}"
+
+    if r.status_code != 200:
+        return [], f"Erro API-Football: {r.status_code}"
+
+    dados = r.json()
+
+    if dados.get("errors"):
+        return [], f"API-Football: {dados['errors']}"
+
+    estados_ignorados = {
+        "FT", "AET", "PEN", "CANC", "ABD", "AWD", "WO",
+    }
+
+    jogos = []
+
+    for item in dados.get("response", []):
+        fixture = item.get("fixture", {})
+        status = fixture.get("status", {}).get("short")
+
+        if status in estados_ignorados:
+            continue
+
+        data_iso = fixture.get("date")
+        if not data_iso:
+            continue
+
+        try:
+            data_pt = datetime.fromisoformat(
+                data_iso.replace("Z", "+00:00")
+            ).astimezone(TZ)
+        except Exception:
+            continue
+
+        if data_pt <= agora:
+            continue
+
+        teams = item.get("teams", {})
+        casa = teams.get("home", {}).get("name") or "Casa"
+        fora = teams.get("away", {}).get("name") or "Fora"
+
+        jogos.append({
+            "match_id": fixture.get("id"),
+            "jogo": f"{casa} vs {fora}",
+            "casa": casa,
+            "fora": fora,
+            "liga": "Brasileirão Série A",
+            "data": data_pt.strftime("%d/%m/%Y %H:%M"),
+            "data_obj": data_pt,
+            "fonte_api": "api_football",
+        })
+
+    jogos.sort(key=lambda x: x["data_obj"])
+
+    for jogo in jogos:
+        jogo.pop("data_obj", None)
+
+    return jogos[:40], None
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def buscar_classificacao_brasileirao():
+    league_id, temporada, erro = obter_brasileirao_api_info()
+
+    if erro:
+        return {}
+
+    url = "https://v3.football.api-sports.io/standings"
+    headers = {
+        "x-apisports-key": API_FOOTBALL_KEY,
+    }
+    params = {
+        "league": league_id,
+        "season": temporada,
+    }
+
+    try:
+        r = requests.get(
+            url,
+            headers=headers,
+            params=params,
+            timeout=20,
+        )
+    except requests.RequestException:
+        return {}
+
+    if r.status_code != 200:
+        return {}
+
+    dados = r.json()
+
+    try:
+        tabela = (
+            dados["response"][0]["league"]["standings"][0]
+        )
+    except Exception:
+        return {}
+
+    posicoes = {}
+
+    for linha in tabela:
+        equipa = linha.get("team", {}).get("name")
+        posicao = linha.get("rank")
+
+        if equipa and posicao:
+            posicoes[equipa] = int(posicao)
+
+    return posicoes
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def buscar_perfil_golos_brasileirao():
+    league_id, temporada, erro = obter_brasileirao_api_info()
+
+    if erro:
+        return {}
+
+    agora = datetime.now(TZ)
+    data_fim = agora.date()
+    data_inicio = (agora - timedelta(days=90)).date()
+
+    url = "https://v3.football.api-sports.io/fixtures"
+    headers = {
+        "x-apisports-key": API_FOOTBALL_KEY,
+    }
+    params = {
+        "league": league_id,
+        "season": temporada,
+        "from": data_inicio.isoformat(),
+        "to": data_fim.isoformat(),
+        "status": "FT",
+        "timezone": "Europe/Lisbon",
+    }
+
+    try:
+        r = requests.get(
+            url,
+            headers=headers,
+            params=params,
+            timeout=20,
+        )
+    except requests.RequestException:
+        return {}
+
+    if r.status_code != 200:
+        return {}
+
+    dados = r.json()
+    perfis = defaultdict(list)
+
+    partidas = dados.get("response", [])
+
+    partidas.sort(
+        key=lambda p: p.get("fixture", {}).get("date", ""),
+        reverse=True,
+    )
+
+    for item in partidas:
+        teams = item.get("teams", {})
+        casa = teams.get("home", {}).get("name")
+        fora = teams.get("away", {}).get("name")
+
+        if not casa or not fora:
+            continue
+
+        goals = item.get("goals", {}) or {}
+        gc = goals.get("home")
+        gf = goals.get("away")
+
+        if gc is None or gf is None:
+            continue
+
+        score = item.get("score", {}) or {}
+        half = score.get("halftime", {}) or {}
+        hc = half.get("home")
+        hf = half.get("away")
+
+        total = gc + gf
+        ambas = gc >= 1 and gf >= 1
+
+        total_intervalo = None
+        if hc is not None and hf is not None:
+            total_intervalo = hc + hf
+
+        registo_casa = {
+            "marcados": gc,
+            "total": total,
+            "intervalo_total": total_intervalo,
+            "ambas": ambas,
+        }
+
+        registo_fora = {
+            "marcados": gf,
+            "total": total,
+            "intervalo_total": total_intervalo,
+            "ambas": ambas,
+        }
+
+        if len(perfis[casa]) < 8:
+            perfis[casa].append(registo_casa)
+
+        if len(perfis[fora]) < 8:
+            perfis[fora].append(registo_fora)
+
+    return dict(perfis)
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def buscar_jogos(nome_liga):
+    if nome_liga == "Brasileirão Série A":
+        return buscar_jogos_brasileirao()
+
     codigo = LIGAS[nome_liga]
 
     agora = datetime.now(TZ)
@@ -660,6 +968,7 @@ def buscar_jogos(nome_liga):
                 "%d/%m/%Y %H:%M"
             ),
             "data_obj": data_pt,
+            "fonte_api": "football_data",
         })
 
     jogos.sort(key=lambda x: x["data_obj"])
@@ -673,6 +982,9 @@ def buscar_jogos(nome_liga):
 @st.cache_data(ttl=300, show_spinner=False)
 @st.cache_data(ttl=600, show_spinner=False)
 def buscar_classificacao(nome_liga):
+    if nome_liga == "Brasileirão Série A":
+        return buscar_classificacao_brasileirao()
+
     codigo = LIGAS[nome_liga]
     url = (
         "https://api.football-data.org/v4/"
@@ -708,6 +1020,9 @@ def buscar_classificacao(nome_liga):
 
 @st.cache_data(ttl=600, show_spinner=False)
 def buscar_perfil_golos_liga(nome_liga):
+    if nome_liga == "Brasileirão Série A":
+        return buscar_perfil_golos_brasileirao()
+
     """
     Usa jogos FINALIZADOS recentes da competição para criar
     um perfil simples de golos de cada equipa.
@@ -1116,6 +1431,86 @@ def buscar_resultados_api(match_ids):
     return resultados
 
 
+
+def buscar_resultados_api_football(match_ids):
+    resultados = {}
+
+    if not match_ids or not API_FOOTBALL_KEY:
+        return resultados
+
+    headers = {
+        "x-apisports-key": API_FOOTBALL_KEY,
+    }
+
+    # A API aceita até 20 IDs por pedido.
+    ids = [str(x) for x in match_ids if x is not None]
+
+    for inicio in range(0, len(ids), 20):
+        lote = ids[inicio:inicio + 20]
+
+        url = "https://v3.football.api-sports.io/fixtures"
+        params = {
+            "ids": "-".join(lote),
+            "timezone": "Europe/Lisbon",
+        }
+
+        try:
+            r = requests.get(
+                url,
+                headers=headers,
+                params=params,
+                timeout=20,
+            )
+        except requests.RequestException:
+            continue
+
+        if r.status_code != 200:
+            continue
+
+        for item in r.json().get("response", []):
+            fixture = item.get("fixture", {})
+            fixture_id = fixture.get("id")
+            status_short = fixture.get(
+                "status", {}
+            ).get("short")
+
+            terminado = status_short in {
+                "FT", "AET", "PEN",
+            }
+
+            goals = item.get("goals", {}) or {}
+            score = item.get("score", {}) or {}
+            half = score.get("halftime", {}) or {}
+
+            # Estrutura normalizada para reutilizar avaliar_previsao().
+            partida_normalizada = {
+                "id": fixture_id,
+                "status": (
+                    "FINISHED"
+                    if terminado
+                    else status_short
+                ),
+                "score": {
+                    "regularTime": {
+                        "home": goals.get("home"),
+                        "away": goals.get("away"),
+                    },
+                    "fullTime": {
+                        "home": goals.get("home"),
+                        "away": goals.get("away"),
+                    },
+                    "halfTime": {
+                        "home": half.get("home"),
+                        "away": half.get("away"),
+                    },
+                },
+            }
+
+            resultados[fixture_id] = partida_normalizada
+
+    return resultados
+
+
 def atualizar_previsao_admin(
     previsao_id,
     placar,
@@ -1268,19 +1663,57 @@ def atualizar_resultados_automaticamente():
     if not pendentes:
         return 0
 
-    match_ids = list({
+    pendentes_football_data = []
+    pendentes_api_football = []
+
+    for p in pendentes:
+        fonte = p.get("fonte_api")
+
+        # Compatibilidade com previsões antigas.
+        if (
+            fonte == "api_football"
+            or p.get("liga") == "Brasileirão Série A"
+        ):
+            pendentes_api_football.append(p)
+        else:
+            pendentes_football_data.append(p)
+
+    ids_football_data = list({
         p["match_id"]
-        for p in pendentes
+        for p in pendentes_football_data
         if p.get("match_id") is not None
     })
 
-    jogos_api = buscar_resultados_api(match_ids)
+    ids_api_football = list({
+        p["match_id"]
+        for p in pendentes_api_football
+        if p.get("match_id") is not None
+    })
+
+    resultados_fd = buscar_resultados_api(
+        ids_football_data
+    )
+
+    resultados_br = buscar_resultados_api_football(
+        ids_api_football
+    )
+
     atualizados = 0
 
     for previsao in pendentes:
-        partida = jogos_api.get(
-            previsao.get("match_id")
-        )
+        fonte = previsao.get("fonte_api")
+
+        if (
+            fonte == "api_football"
+            or previsao.get("liga") == "Brasileirão Série A"
+        ):
+            partida = resultados_br.get(
+                previsao.get("match_id")
+            )
+        else:
+            partida = resultados_fd.get(
+                previsao.get("match_id")
+            )
 
         if not partida:
             continue
@@ -2033,10 +2466,26 @@ with tab_prever:
         jogo = jogos[indice_jogo]
         bloqueado = jogo_comecou(jogo)
 
+        fonte_jogo = jogo.get(
+            "fonte_api",
+            fonte_api_liga(jogo["liga"]),
+        )
+
         existentes = [
             p for p in minhas
-            if str(p.get("match_id"))
-            == str(jogo["match_id"])
+            if (
+                str(p.get("match_id"))
+                == str(jogo["match_id"])
+                and (
+                    p.get("fonte_api")
+                    or (
+                        "api_football"
+                        if p.get("liga") == "Brasileirão Série A"
+                        else "football_data"
+                    )
+                )
+                == fonte_jogo
+            )
         ]
 
         tipos_ja_feitos = {
@@ -2181,6 +2630,11 @@ with tab_prever:
                                 st.session_state["nome"],
                             "match_id":
                                 jogo["match_id"],
+                            "fonte_api":
+                                jogo.get(
+                                    "fonte_api",
+                                    fonte_api_liga(jogo["liga"]),
+                                ),
                             "jogo":
                                 jogo["jogo"],
                             "casa":
@@ -2347,9 +2801,18 @@ with tab_minhas:
         grupos = defaultdict(list)
 
         for p in filtradas:
-            grupos[p.get("match_id")].append(p)
+            chave_jogo = (
+                p.get("fonte_api")
+                or (
+                    "api_football"
+                    if p.get("liga") == "Brasileirão Série A"
+                    else "football_data"
+                ),
+                p.get("match_id"),
+            )
+            grupos[chave_jogo].append(p)
 
-        for match_id, lista in grupos.items():
+        for chave_jogo, lista in grupos.items():
             primeira = lista[0]
 
             titulo = (
@@ -2671,7 +3134,16 @@ with tab_historico:
 
             grupos_hist = defaultdict(list)
             for p in historico_recente:
-                grupos_hist[p.get("match_id")].append(p)
+                chave_hist = (
+                    p.get("fonte_api")
+                    or (
+                        "api_football"
+                        if p.get("liga") == "Brasileirão Série A"
+                        else "football_data"
+                    ),
+                    p.get("match_id"),
+                )
+                grupos_hist[chave_hist].append(p)
 
             for _, lista in grupos_hist.items():
                 primeira = lista[0]
