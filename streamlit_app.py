@@ -575,10 +575,18 @@ def apagar_previsao_utilizador(previsao_id):
 
 def buscar_jogos(nome_liga):
     codigo = LIGAS[nome_liga]
+
+    agora = datetime.now(TZ)
+    data_inicio = agora.date()
+    data_fim = (agora + timedelta(days=45)).date()
+
     url = (
         "https://api.football-data.org/v4/"
         f"competitions/{codigo}/matches"
+        f"?dateFrom={data_inicio.isoformat()}"
+        f"&dateTo={data_fim.isoformat()}"
     )
+
     headers = {"X-Auth-Token": FOOTBALL_API_KEY}
 
     try:
@@ -591,35 +599,55 @@ def buscar_jogos(nome_liga):
         return [], f"Erro de ligação: {erro}"
 
     if r.status_code != 200:
-        return [], f"Erro da API: {r.status_code}"
+        detalhe = ""
+        try:
+            detalhe = r.json().get("message", "")
+        except Exception:
+            pass
 
-    agora = datetime.now(TZ)
+        mensagem = f"Erro da API: {r.status_code}"
+        if detalhe:
+            mensagem += f" — {detalhe}"
+        return [], mensagem
+
     jogos = []
 
+    estados_ignorados = {
+        "FINISHED",
+        "CANCELLED",
+        "AWARDED",
+    }
+
     for partida in r.json().get("matches", []):
-        if partida.get("status") not in [
-            "SCHEDULED",
-            "TIMED",
-        ]:
+        if partida.get("status") in estados_ignorados:
             continue
 
-        data_utc = datetime.strptime(
-            partida["utcDate"],
-            "%Y-%m-%dT%H:%M:%SZ",
-        ).replace(tzinfo=ZoneInfo("UTC"))
+        utc_date = partida.get("utcDate")
+        if not utc_date:
+            continue
+
+        try:
+            data_utc = datetime.strptime(
+                utc_date,
+                "%Y-%m-%dT%H:%M:%SZ",
+            ).replace(tzinfo=ZoneInfo("UTC"))
+        except ValueError:
+            continue
 
         data_pt = data_utc.astimezone(TZ)
 
         if data_pt <= agora:
             continue
 
-        casa = partida.get(
-            "homeTeam", {}
-        ).get("name", "Casa")
+        casa = (
+            partida.get("homeTeam", {}).get("name")
+            or "Casa"
+        )
 
-        fora = partida.get(
-            "awayTeam", {}
-        ).get("name", "Fora")
+        fora = (
+            partida.get("awayTeam", {}).get("name")
+            or "Fora"
+        )
 
         jogos.append({
             "match_id": partida["id"],
@@ -1691,9 +1719,15 @@ with tab_prever:
         jogos = []
 
     if not jogos:
-        st.info(
-            "Carrega os jogos desta competição."
-        )
+        if st.session_state.get("liga_carregada") == liga:
+            st.info(
+                "Não encontrei jogos futuros desta competição "
+                "nos próximos 45 dias."
+            )
+        else:
+            st.info(
+                "Carrega os jogos desta competição."
+            )
 
     if jogos:
         indice_jogo = st.selectbox(
