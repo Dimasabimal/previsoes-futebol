@@ -415,7 +415,6 @@ def aplicar_sessao(dados, nome_fallback=None):
     refresh_token = dados.get("refresh_token")
     if refresh_token:
         cookies["refresh_token"] = refresh_token
-        cookies.save()
 
 
 def tentar_restaurar_sessao():
@@ -1500,6 +1499,7 @@ if "access_token" not in st.session_state:
                         dados,
                         nome_fallback=username_login,
                     )
+                    cookies.save()
                     st.rerun()
                 else:
                     st.error(
@@ -1559,6 +1559,7 @@ if "access_token" not in st.session_state:
                             dados,
                             nome_fallback=novo_username.strip(),
                         )
+                        cookies.save()
                         st.rerun()
                     else:
                         st.success(
