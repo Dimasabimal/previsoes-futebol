@@ -50,6 +50,7 @@ NOMES_TIPOS = {
     "golos_equipa_casa": "Golos — equipa da casa",
     "golos_equipa_fora": "Golos — equipa visitante",
     "ambas_marcam": "Ambas as equipas marcam",
+    "dupla_possibilidade": "Dupla possibilidade",
 }
 
 MINIMO_RANKING_PRECISAO = 10
@@ -107,17 +108,54 @@ def jogo_comecou(previsao_ou_jogo):
 
 def calcular_pontos(previsao):
     resultado = previsao.get("resultado", "Pendente")
-    confianca = previsao.get("confianca", 0) or 0
     try:
-        confianca = int(confianca)
+        confianca = int(previsao.get("confianca", 0) or 0)
     except Exception:
         confianca = 0
 
+    try:
+        multiplicador = float(previsao.get("multiplicador", 1) or 1)
+    except Exception:
+        multiplicador = 1.0
+
     if resultado == "Acertou":
-        return confianca
+        return confianca * multiplicador
     if resultado == "Errou":
         return -confianca
     return 0
+
+
+def formatar_pontos(valor):
+    try:
+        numero = float(valor)
+    except Exception:
+        numero = 0.0
+
+    if numero.is_integer():
+        return f"{int(numero):+d}"
+    return f"{numero:+.1f}"
+
+
+def inicio_semana(agora=None):
+    agora = agora or datetime.now(TZ)
+    base = agora.replace(hour=0, minute=0, second=0, microsecond=0)
+    return base - timedelta(days=base.weekday())
+
+
+def filtrar_periodo(lista, periodo):
+    agora = datetime.now(TZ)
+    if periodo == "Total":
+        return list(lista)
+
+    if periodo == "Esta semana":
+        inicio = inicio_semana(agora)
+        return [p for p in lista if (parse_data_jogo(p.get("data")) or parse_created_at(p.get("created_at"))) and (parse_data_jogo(p.get("data")) or parse_created_at(p.get("created_at"))) >= inicio]
+
+    if periodo == "Este mês":
+        inicio = agora.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        return [p for p in lista if (parse_data_jogo(p.get("data")) or parse_created_at(p.get("created_at"))) and (parse_data_jogo(p.get("data")) or parse_created_at(p.get("created_at"))) >= inicio]
+
+    return list(lista)
 
 
 def valor_minimo_golos(valor):
@@ -246,6 +284,13 @@ def equipa_associada_previsao(p):
         if valor == "Casa":
             return p.get("casa")
         if valor == "Fora":
+            return p.get("fora")
+        return None
+
+    if tipo == "dupla_possibilidade":
+        if valor == "CasaEmpate":
+            return p.get("casa")
+        if valor == "ForaEmpate":
             return p.get("fora")
         return None
 
@@ -597,6 +642,84 @@ def buscar_jogos(nome_liga):
     return jogos[:40], None
 
 
+def buscar_classificacao(nome_liga):
+    codigo = LIGAS[nome_liga]
+    url = (
+        "https://api.football-data.org/v4/"
+        f"competitions/{codigo}/standings"
+    )
+    headers = {"X-Auth-Token": FOOTBALL_API_KEY}
+
+    try:
+        r = requests.get(url, headers=headers, timeout=20)
+    except requests.RequestException:
+        return {}
+
+    if r.status_code != 200:
+        return {}
+
+    posicoes = {}
+    for bloco in r.json().get("standings", []):
+        if bloco.get("type") not in ["TOTAL", None]:
+            continue
+        for linha in bloco.get("table", []):
+            equipa = linha.get("team", {}).get("name")
+            posicao = linha.get("position")
+            if equipa and posicao:
+                posicoes[equipa] = int(posicao)
+        if posicoes:
+            break
+
+    return posicoes
+
+
+def dificuldade_previsao(tipo, valor, jogo, posicoes):
+    # Para mercados que não representam diretamente a força de uma equipa,
+    # usamos dificuldade neutra.
+    if tipo not in ["resultado", "dupla_possibilidade"]:
+        return "Fácil", 1.0
+
+    casa = jogo.get("casa")
+    fora = jogo.get("fora")
+    pc = posicoes.get(casa)
+    pf = posicoes.get(fora)
+
+    if tipo == "resultado" and valor == "Empate":
+        return "Difícil", 2.0
+
+    if tipo == "dupla_possibilidade" and valor == "CasaFora":
+        return "Média", 1.5
+
+    # Se não houver classificação disponível, mantemos uma dificuldade neutra.
+    if not pc or not pf:
+        return "Média", 1.5
+
+    if tipo == "resultado":
+        if valor == "Casa":
+            delta = pc - pf
+        else:
+            delta = pf - pc
+
+        if delta <= -5:
+            return "Fácil", 1.0
+        if delta <= 1:
+            return "Média", 1.5
+        if delta <= 6:
+            return "Difícil", 2.0
+        return "Muito difícil", 3.0
+
+    # Dupla possibilidade: lado + empate.
+    if valor == "CasaEmpate":
+        delta = pc - pf
+    else:
+        delta = pf - pc
+
+    if delta <= -5:
+        return "Fácil", 1.0
+    if delta <= 2:
+        return "Média", 1.5
+    return "Difícil", 2.0
+
 
 # =========================================================
 # RESULTADOS AUTOMÁTICOS
@@ -729,6 +852,21 @@ def avaliar_previsao(previsao, partida):
             real = "Empate"
 
         return placar, real, valor == real
+
+    if tipo == "dupla_possibilidade":
+        if golos_casa > golos_fora:
+            real = "Casa"
+        elif golos_fora > golos_casa:
+            real = "Fora"
+        else:
+            real = "Empate"
+
+        acertou = (
+            (valor == "CasaEmpate" and real in ["Casa", "Empate"])
+            or (valor == "ForaEmpate" and real in ["Fora", "Empate"])
+            or (valor == "CasaFora" and real in ["Casa", "Fora"])
+        )
+        return placar, real, acertou
 
     if tipo == "golos_tempo_regulamentar":
         total = golos_casa + golos_fora
@@ -956,6 +1094,29 @@ def verificar_contradicao(
                 "'Ambas marcam: Sim'."
             )
 
+        # Resultado exato vs dupla possibilidade incompatível.
+        if novo_tipo == "resultado":
+            if novo_valor == "Casa" and tipo == "dupla_possibilidade" and valor == "ForaEmpate":
+                return True, "'Casa vence' contradiz 'Fora ou Empate'."
+            if novo_valor == "Fora" and tipo == "dupla_possibilidade" and valor == "CasaEmpate":
+                return True, "'Fora vence' contradiz 'Casa ou Empate'."
+            if novo_valor == "Empate" and tipo == "dupla_possibilidade" and valor == "CasaFora":
+                return True, "'Empate' contradiz 'Casa ou Fora'."
+
+        if novo_tipo == "dupla_possibilidade":
+            if novo_valor == "CasaEmpate" and tipo == "resultado" and valor == "Fora":
+                return True, "'Casa ou Empate' contradiz 'Fora vence'."
+            if novo_valor == "ForaEmpate" and tipo == "resultado" and valor == "Casa":
+                return True, "'Fora ou Empate' contradiz 'Casa vence'."
+            if novo_valor == "CasaFora" and tipo == "resultado" and valor == "Empate":
+                return True, "'Casa ou Fora' contradiz 'Empate'."
+            if novo_valor == "CasaFora" and tipo == "golos_tempo_regulamentar" and valor == "0":
+                return True, "'Casa ou Fora' contradiz 0 golos no jogo."
+
+        if novo_tipo == "golos_tempo_regulamentar" and novo_valor == "0":
+            if tipo == "dupla_possibilidade" and valor == "CasaFora":
+                return True, "0 golos no jogo contradiz 'Casa ou Fora'."
+
     return False, ""
 
 
@@ -969,6 +1130,13 @@ def opcoes_para_tipo(tipo, jogo):
             f"{jogo['casa']} vence": "Casa",
             "Empate": "Empate",
             f"{jogo['fora']} vence": "Fora",
+        }
+
+    if tipo == "dupla_possibilidade":
+        return {
+            f"{jogo['casa']} ou Empate": "CasaEmpate",
+            f"{jogo['fora']} ou Empate": "ForaEmpate",
+            f"{jogo['casa']} ou {jogo['fora']}": "CasaFora",
         }
 
     if tipo == "golos_tempo_regulamentar":
@@ -1014,6 +1182,13 @@ def texto_previsao(tipo, valor, jogo):
         if valor == "Fora":
             return f"{jogo['fora']} vence"
         return "Empate"
+
+    if tipo == "dupla_possibilidade":
+        if valor == "CasaEmpate":
+            return f"{jogo['casa']} ou Empate"
+        if valor == "ForaEmpate":
+            return f"{jogo['fora']} ou Empate"
+        return f"{jogo['casa']} ou {jogo['fora']}"
 
     if tipo == "golos_tempo_regulamentar":
         nome = next(
@@ -1111,7 +1286,7 @@ def mostrar_estatisticas_completas(lista, prefixo=""):
     m3.metric("Erros", stats["erros"])
     m4.metric("Pendentes", stats["pendentes"])
     m5.metric("Taxa", f"{stats['taxa']:.1f}%")
-    m6.metric("Pontos", f"{stats['pontos']:+d}")
+    m6.metric("Pontos", formatar_pontos(stats["pontos"]))
 
     st.subheader("Resumo do perfil")
     r1, r2, r3, r4, r5 = st.columns(5)
@@ -1245,7 +1420,7 @@ def mostrar_estatisticas_completas(lista, prefixo=""):
         e = estatisticas_basicas(itens)
         st.write(
             f"**Últimos {dias} dias:** "
-            f"{e['taxa']:.1f}% • {e['pontos']:+d} pontos • "
+            f"{e['taxa']:.1f}% • {formatar_pontos(e['pontos'])} pontos • "
             f"{e['concluidas']} concluídas"
         )
 
@@ -1429,17 +1604,34 @@ minhas = [
     == str(st.session_state["user_id"])
 ]
 
+# Aviso simples de novos resultados desde a última visita.
+concluidas_agora = sum(1 for p in minhas if p.get("resultado") in ["Acertou", "Errou"])
+try:
+    concluidas_antes = int(cookies.get("concluidas_vistas") or 0)
+except Exception:
+    concluidas_antes = 0
+
+if concluidas_agora > concluidas_antes and concluidas_antes > 0:
+    st.info(
+        f"✅ {concluidas_agora - concluidas_antes} das tuas previsões "
+        "foram atualizadas desde a última visita."
+    )
+
+cookies["concluidas_vistas"] = str(concluidas_agora)
+cookies.save()
+
 
 # =========================================================
 # TABS PRINCIPAIS
 # =========================================================
 
-tab_prever, tab_minhas, tab_stats, tab_historico, tab_ranking, tab_perfis = st.tabs([
+tab_prever, tab_minhas, tab_stats, tab_historico, tab_ranking, tab_comparar, tab_perfis = st.tabs([
     "⚽ Prever",
     "📋 Minhas previsões",
     "📊 Estatísticas",
     "📜 Histórico",
     "🏆 Ranking",
+    "⚖️ Comparar",
     "👥 Perfis",
 ])
 
@@ -1475,6 +1667,9 @@ with tab_prever:
             st.session_state[
                 "jogos"
             ] = jogos_novos
+            st.session_state[
+                "classificacao"
+            ] = buscar_classificacao(liga)
             st.session_state[
                 "liga_carregada"
             ] = liga
@@ -1547,6 +1742,7 @@ with tab_prever:
         else:
             tipos_ui = {
                 "Resultado do jogo": "resultado",
+                "Dupla possibilidade": "dupla_possibilidade",
                 "Golos — tempo regulamentar":
                     "golos_tempo_regulamentar",
                 "Golos — intervalo":
@@ -1597,7 +1793,17 @@ with tab_prever:
                 jogo,
             )
 
-            st.info(f"🎯 {texto}")
+            posicoes = st.session_state.get("classificacao", {})
+            dificuldade, multiplicador = dificuldade_previsao(
+                tipo, valor, jogo, posicoes
+            )
+
+            st.info(
+                f"🎯 {texto}\n\n"
+                f"Dificuldade: **{dificuldade} ×{multiplicador:g}** • "
+                f"Se acertar: **{formatar_pontos(confianca * multiplicador)} pontos** • "
+                f"Se errar: **-{confianca} pontos**"
+            )
 
             if st.button(
                 "Guardar previsão",
@@ -1664,6 +1870,10 @@ with tab_prever:
                                 equipa_previsao,
                             "confianca":
                                 confianca,
+                            "dificuldade":
+                                dificuldade,
+                            "multiplicador":
+                                multiplicador,
                             "placar":
                                 "",
                             "resultado":
@@ -1848,11 +2058,15 @@ with tab_minhas:
                         "**Confiança:**",
                         f"{p.get('confianca', '')}/5",
                     )
+                    st.write(
+                        "**Dificuldade:**",
+                        f"{p.get('dificuldade', 'Fácil')} ×{float(p.get('multiplicador', 1) or 1):g}",
+                    )
 
                     if estado != "Pendente":
                         st.write(
                             "**Pontos:**",
-                            f"{calcular_pontos(p):+d}",
+                            formatar_pontos(calcular_pontos(p)),
                         )
 
                     if p.get("placar"):
@@ -2097,6 +2311,13 @@ with tab_historico:
             if p.get("utilizador") != nome_historico:
                 continue
 
+            # As previsões dos outros só ficam visíveis depois do início do jogo.
+            if (
+                str(p.get("user_id")) != str(st.session_state["user_id"])
+                and not jogo_comecou(p)
+            ):
+                continue
+
             data_jogo = parse_data_jogo(p.get("data"))
             if data_jogo and inicio <= data_jogo <= agora:
                 historico_recente.append(p)
@@ -2115,7 +2336,7 @@ with tab_historico:
             c1.metric("Previsões", resumo["total"])
             c2.metric("Acertos", resumo["acertos"])
             c3.metric("Taxa", f"{resumo['taxa']:.1f}%")
-            c4.metric("Pontos", f"{resumo['pontos']:+d}")
+            c4.metric("Pontos", formatar_pontos(resumo["pontos"]))
 
             grupos_hist = defaultdict(list)
             for p in historico_recente:
@@ -2141,9 +2362,13 @@ with tab_historico:
                         )
                         st.write(f"Previsão: {p.get('previsao', '')}")
                         st.write(f"Confiança: {p.get('confianca', '')}/5")
+                        st.write(
+                            f"Dificuldade: {p.get('dificuldade', 'Fácil')} "
+                            f"×{float(p.get('multiplicador', 1) or 1):g}"
+                        )
                         st.write(f"Resultado: {estado}")
                         if estado != "Pendente":
-                            st.write(f"Pontos: {calcular_pontos(p):+d}")
+                            st.write(f"Pontos: {formatar_pontos(calcular_pontos(p))}")
                         if p.get("placar"):
                             st.write(f"Placar: {p.get('placar')}")
                         st.divider()
@@ -2154,8 +2379,17 @@ with tab_historico:
 # =========================================================
 
 with tab_ranking:
+    periodo_ranking = st.radio(
+        "Período",
+        ["Total", "Esta semana", "Este mês"],
+        horizontal=True,
+        key="periodo_ranking",
+    )
+
+    previsoes_ranking = filtrar_periodo(previsoes, periodo_ranking)
+
     grupos_amigos = defaultdict(list)
-    for p in previsoes:
+    for p in previsoes_ranking:
         grupos_amigos[p.get("utilizador", "Sem nome")].append(p)
 
     elegiveis = []
@@ -2239,6 +2473,26 @@ with tab_ranking:
             use_container_width=True,
         )
 
+    st.subheader("🌟 Melhor previsão da semana")
+    semana = filtrar_periodo(previsoes, "Esta semana")
+    acertos_semana = [p for p in semana if p.get("resultado") == "Acertou"]
+    if acertos_semana:
+        melhor_prev = max(
+            acertos_semana,
+            key=lambda p: (
+                float(p.get("multiplicador", 1) or 1),
+                int(p.get("confianca", 0) or 0),
+            ),
+        )
+        st.success(
+            f"{melhor_prev.get('utilizador')} — {melhor_prev.get('previsao')} • "
+            f"{melhor_prev.get('dificuldade', 'Fácil')} "
+            f"×{float(melhor_prev.get('multiplicador', 1) or 1):g} • "
+            f"{formatar_pontos(calcular_pontos(melhor_prev))} pontos"
+        )
+    else:
+        st.info("Ainda não há previsões certas esta semana.")
+
     st.subheader("🥇 Melhor por categoria")
 
     categorias = sorted({
@@ -2281,6 +2535,71 @@ with tab_ranking:
 
 
 # =========================================================
+# TAB — COMPARAR E CONSENSO
+# =========================================================
+
+with tab_comparar:
+    nomes_comparar = sorted({
+        p.get("utilizador") for p in previsoes if p.get("utilizador")
+    })
+
+    st.subheader("⚖️ Comparar utilizadores")
+    if len(nomes_comparar) < 2:
+        st.info("São necessários pelo menos dois utilizadores.")
+    else:
+        c1, c2 = st.columns(2)
+        with c1:
+            nome_a = st.selectbox("Utilizador A", nomes_comparar, key="comp_a")
+        with c2:
+            opcoes_b = [n for n in nomes_comparar if n != nome_a]
+            nome_b = st.selectbox("Utilizador B", opcoes_b, key="comp_b")
+
+        a = [p for p in previsoes if p.get("utilizador") == nome_a]
+        b = [p for p in previsoes if p.get("utilizador") == nome_b]
+        ea = estatisticas_basicas(a)
+        eb = estatisticas_basicas(b)
+        sa, ma = sequencias(a)
+        sb, mb = sequencias(b)
+
+        st.dataframe([
+            {"Métrica": "Precisão", nome_a: f"{ea['taxa']:.1f}%", nome_b: f"{eb['taxa']:.1f}%"},
+            {"Métrica": "Pontos", nome_a: formatar_pontos(ea['pontos']), nome_b: formatar_pontos(eb['pontos'])},
+            {"Métrica": "Concluídas", nome_a: ea['concluidas'], nome_b: eb['concluidas']},
+            {"Métrica": "Melhor liga", nome_a: melhor_liga(a), nome_b: melhor_liga(b)},
+            {"Métrica": "Melhor tipo", nome_a: melhor_categoria(a), nome_b: melhor_categoria(b)},
+            {"Métrica": "Sequência atual", nome_a: sa, nome_b: sb},
+            {"Métrica": "Melhor sequência", nome_a: ma, nome_b: mb},
+        ], hide_index=True, use_container_width=True)
+
+    st.divider()
+    st.subheader("🤝 Consenso entre amigos")
+    jogos_comecados = {}
+    for p in previsoes:
+        if jogo_comecou(p):
+            jogos_comecados[p.get("match_id")] = p
+
+    if not jogos_comecados:
+        st.info("Ainda não há jogos começados com previsões.")
+    else:
+        ids = list(jogos_comecados.keys())
+        id_escolhido = st.selectbox(
+            "Jogo",
+            ids,
+            format_func=lambda mid: f"{jogos_comecados[mid].get('data', '')} — {jogos_comecados[mid].get('jogo', '')}",
+            key="consenso_jogo",
+        )
+        itens = [p for p in previsoes if p.get("match_id") == id_escolhido]
+        contagem = defaultdict(int)
+        for p in itens:
+            contagem[p.get("previsao", "Sem descrição")] += 1
+        tabela_consenso = [
+            {"Previsão": nome, "Pessoas": total}
+            for nome, total in sorted(contagem.items(), key=lambda x: x[1], reverse=True)
+        ]
+        st.dataframe(tabela_consenso, hide_index=True, use_container_width=True)
+
+
+# =========================================================
 # TAB — PERFIS
 # =========================================================
 
@@ -2310,4 +2629,23 @@ with tab_perfis:
             perfil,
             prefixo=f"perfil_{nome_escolhido}",
         )
+
+        st.subheader("🏅 Conquistas")
+        e_perfil = estatisticas_basicas(perfil)
+        atual, melhor_seq = sequencias(perfil)
+        badges = []
+        if e_perfil["concluidas"] >= 10:
+            badges.append("🎯 10 previsões concluídas")
+        if melhor_seq >= 5:
+            badges.append("🔥 5 acertos seguidos")
+        conf5 = [p for p in perfil if int(p.get("confianca", 0) or 0) == 5 and p.get("resultado") in ["Acertou", "Errou"]]
+        if len(conf5) >= 5 and estatisticas_basicas(conf5)["taxa"] >= 70:
+            badges.append("🧠 70%+ com confiança 5/5")
+        if e_perfil["concluidas"] >= 20:
+            badges.append("🏟️ Veterano — 20 previsões concluídas")
+        if badges:
+            for badge in badges:
+                st.write(badge)
+        else:
+            st.caption("Ainda sem conquistas desbloqueadas.")
 
