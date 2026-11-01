@@ -573,6 +573,7 @@ def apagar_previsao_utilizador(previsao_id):
 # API DE FUTEBOL
 # =========================================================
 
+@st.cache_data(ttl=300, show_spinner=False)
 def buscar_jogos(nome_liga):
     codigo = LIGAS[nome_liga]
 
@@ -669,6 +670,7 @@ def buscar_jogos(nome_liga):
     return jogos[:40], None
 
 
+@st.cache_data(ttl=300, show_spinner=False)
 def buscar_classificacao(nome_liga):
     codigo = LIGAS[nome_liga]
     url = (
@@ -1679,55 +1681,22 @@ with tab_prever:
         key="liga_prever",
     )
 
-    if st.button(
-        "Carregar jogos",
-        key="carregar_jogos_liga",
-    ):
-        with st.spinner(
-            "A carregar jogos..."
-        ):
-            jogos_novos, erro = buscar_jogos(
-                liga
-            )
+    # Os jogos são carregados automaticamente quando a competição muda.
+    with st.spinner("A carregar jogos..."):
+        jogos, erro = buscar_jogos(liga)
+        classificacao_atual = buscar_classificacao(liga)
 
-        if erro:
-            st.error(erro)
-        else:
-            st.session_state[
-                "jogos"
-            ] = jogos_novos
-            st.session_state[
-                "classificacao"
-            ] = buscar_classificacao(liga)
-            st.session_state[
-                "liga_carregada"
-            ] = liga
-            st.session_state.pop(
-                "indice_jogo_novo",
-                None,
-            )
+    st.session_state["classificacao"] = classificacao_atual
 
-    if (
-        st.session_state.get(
-            "liga_carregada"
-        ) == liga
-    ):
-        jogos = st.session_state.get(
-            "jogos", []
-        )
-    else:
+    if erro:
+        st.error(erro)
         jogos = []
 
-    if not jogos:
-        if st.session_state.get("liga_carregada") == liga:
-            st.info(
-                "Não encontrei jogos futuros desta competição "
-                "nos próximos 45 dias."
-            )
-        else:
-            st.info(
-                "Carrega os jogos desta competição."
-            )
+    if not jogos and not erro:
+        st.info(
+            "Não encontrei jogos futuros desta competição "
+            "nos próximos 45 dias."
+        )
 
     if jogos:
         indice_jogo = st.selectbox(
