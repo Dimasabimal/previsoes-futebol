@@ -5,7 +5,7 @@ import unicodedata
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from collections import defaultdict
-from streamlit_cookies_manager import EncryptedCookieManager
+from st_cookie_manager import EncryptedCookieManager
 
 # =========================================================
 # CONFIGURAÇÃO
