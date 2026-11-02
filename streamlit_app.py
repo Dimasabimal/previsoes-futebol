@@ -3502,7 +3502,7 @@ def mostrar_estatisticas_completas(lista, prefixo=""):
 
     st.write(f"**Melhor sequência:** {melhor_streak}")
     st.write(f"**Melhor mês:** {melhor_mes}")
-    st.write(f"**Melhor fim de semana:** {melhor_fds:+d} pontos")
+    st.write(f"**Melhor fim de semana:** {formatar_pontos(melhor_fds)} pontos")
     st.write(f"**Melhor liga:** {melhor_liga(lista)}")
     st.write(f"**Melhor categoria:** {melhor_categoria(lista)}")
 
