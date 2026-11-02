@@ -303,7 +303,7 @@ def equipa_associada_previsao(p):
             return p.get("fora")
         return None
 
-    """Devolve apenas a equipa realmente associada à previsão."""
+    # Devolve apenas a equipa realmente associada à previsão.
     tipo = p.get("tipo_previsao")
     valor = p.get("valor_previsao")
 
