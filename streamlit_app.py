@@ -21,7 +21,7 @@ SUPABASE_URL = st.secrets["SUPABASE_URL"].rstrip("/")
 SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
 SUPABASE_SECRET_KEY = st.secrets["SUPABASE_SECRET_KEY"]
 FOOTBALL_API_KEY = st.secrets["FOOTBALL_API_KEY"]
-API_FOOTBALL_KEY = st.secrets.get("API_FOOTBALL_KEY", "")
+BRASILEIRAO_API_KEY = st.secrets.get("BRASILEIRAO_API_KEY", "")
 
 # Cookie encriptado para manter a sessão iniciada entre visitas.
 # A chave privada do servidor é usada apenas como palavra-passe de encriptação.
@@ -576,125 +576,91 @@ def apagar_previsao_utilizador(previsao_id):
 # =========================================================
 
 
+
+BRASILEIRAO_RAPIDAPI_HOST = "brasileirao-serie-a.p.rapidapi.com"
+BRASILEIRAO_RAPIDAPI_BASE = (
+    f"https://{BRASILEIRAO_RAPIDAPI_HOST}"
+)
+
+
 def fonte_api_liga(nome_liga):
     if nome_liga == "Brasileirão Série A":
-        return "api_football"
+        return "rapidapi_brasileirao"
     return "football_data"
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def obter_brasileirao_api_info():
-    """
-    Descobre o ID da Serie A do Brasil na API-Football para a época atual.
-    O ID é estável, mas fazer a descoberta uma vez por dia evita hardcode
-    e deixa a integração mais robusta.
-    """
-    if not API_FOOTBALL_KEY:
-        return None, None, "API_FOOTBALL_KEY não configurada."
-
-    temporada = datetime.now(TZ).year
-
-    url = "https://v3.football.api-sports.io/leagues"
-    headers = {
-        "x-apisports-key": API_FOOTBALL_KEY,
-    }
-    params = {
-        "country": "Brazil",
-        "season": temporada,
-        "search": "Serie A",
+def headers_brasileirao():
+    return {
+        "X-RapidAPI-Key": BRASILEIRAO_API_KEY,
+        "X-RapidAPI-Host": BRASILEIRAO_RAPIDAPI_HOST,
     }
 
-    try:
-        r = requests.get(
-            url,
-            headers=headers,
-            params=params,
-            timeout=20,
+
+def erro_rapidapi(dados, status_code):
+    if status_code != 200:
+        return f"Erro Brasileirão API: {status_code}"
+
+    if isinstance(dados, dict) and dados.get("error"):
+        erro = dados.get("error") or {}
+        return (
+            erro.get("message")
+            or erro.get("code")
+            or "Erro na API do Brasileirão."
         )
-    except requests.RequestException as erro:
-        return None, None, f"Erro de ligação à API-Football: {erro}"
 
-    if r.status_code != 200:
-        return None, None, f"Erro API-Football: {r.status_code}"
-
-    dados = r.json()
-
-    if dados.get("errors"):
-        return None, None, f"API-Football: {dados['errors']}"
-
-    respostas = dados.get("response", [])
-
-    for item in respostas:
-        liga = item.get("league", {})
-        pais = item.get("country", {})
-
-        if (
-            liga.get("name") == "Serie A"
-            and pais.get("name") == "Brazil"
-        ):
-            return liga.get("id"), temporada, None
-
-    return None, None, (
-        "Não encontrei a Serie A do Brasil "
-        f"para a época {temporada} na API-Football."
-    )
+    return None
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def buscar_jogos_brasileirao():
-    league_id, temporada, erro = obter_brasileirao_api_info()
-
-    if erro:
-        return [], erro
+    if not BRASILEIRAO_API_KEY:
+        return [], (
+            "BRASILEIRAO_API_KEY não está configurada "
+            "nos Secrets do Streamlit."
+        )
 
     agora = datetime.now(TZ)
     data_inicio = agora.date()
     data_fim = (agora + timedelta(days=45)).date()
 
-    url = "https://v3.football.api-sports.io/fixtures"
-    headers = {
-        "x-apisports-key": API_FOOTBALL_KEY,
-    }
+    url = f"{BRASILEIRAO_RAPIDAPI_BASE}/matches"
     params = {
-        "league": league_id,
-        "season": temporada,
+        "season": str(agora.year),
         "from": data_inicio.isoformat(),
         "to": data_fim.isoformat(),
-        "timezone": "Europe/Lisbon",
+        "limit": 200,
     }
 
     try:
         r = requests.get(
             url,
-            headers=headers,
+            headers=headers_brasileirao(),
             params=params,
             timeout=20,
         )
-    except requests.RequestException as erro_req:
-        return [], f"Erro de ligação à API-Football: {erro_req}"
+    except requests.RequestException as erro:
+        return [], f"Erro de ligação à API do Brasileirão: {erro}"
 
-    if r.status_code != 200:
-        return [], f"Erro API-Football: {r.status_code}"
+    try:
+        dados = r.json()
+    except Exception:
+        return [], (
+            "A API do Brasileirão devolveu uma resposta inválida."
+        )
 
-    dados = r.json()
-
-    if dados.get("errors"):
-        return [], f"API-Football: {dados['errors']}"
-
-    estados_ignorados = {
-        "FT", "AET", "PEN", "CANC", "ABD", "AWD", "WO",
-    }
+    erro = erro_rapidapi(dados, r.status_code)
+    if erro:
+        return [], erro
 
     jogos = []
 
-    for item in dados.get("response", []):
-        fixture = item.get("fixture", {})
-        status = fixture.get("status", {}).get("short")
+    for item in dados.get("data", []):
+        status = str(item.get("status", "")).lower()
 
-        if status in estados_ignorados:
+        if status in {"finished", "cancelled"}:
             continue
 
-        data_iso = fixture.get("date")
+        data_iso = item.get("kickoff")
         if not data_iso:
             continue
 
@@ -708,19 +674,28 @@ def buscar_jogos_brasileirao():
         if data_pt <= agora:
             continue
 
-        teams = item.get("teams", {})
-        casa = teams.get("home", {}).get("name") or "Casa"
-        fora = teams.get("away", {}).get("name") or "Fora"
+        casa = (
+            item.get("homeTeam", {}).get("name")
+            or "Casa"
+        )
+        fora = (
+            item.get("awayTeam", {}).get("name")
+            or "Fora"
+        )
+
+        match_id = item.get("id")
+        if match_id is None:
+            continue
 
         jogos.append({
-            "match_id": fixture.get("id"),
+            "match_id": match_id,
             "jogo": f"{casa} vs {fora}",
             "casa": casa,
             "fora": fora,
             "liga": "Brasileirão Série A",
             "data": data_pt.strftime("%d/%m/%Y %H:%M"),
             "data_obj": data_pt,
-            "fonte_api": "api_football",
+            "fonte_api": "rapidapi_brasileirao",
         })
 
     jogos.sort(key=lambda x: x["data_obj"])
@@ -733,24 +708,18 @@ def buscar_jogos_brasileirao():
 
 @st.cache_data(ttl=600, show_spinner=False)
 def buscar_classificacao_brasileirao():
-    league_id, temporada, erro = obter_brasileirao_api_info()
-
-    if erro:
+    if not BRASILEIRAO_API_KEY:
         return {}
 
-    url = "https://v3.football.api-sports.io/standings"
-    headers = {
-        "x-apisports-key": API_FOOTBALL_KEY,
-    }
+    url = f"{BRASILEIRAO_RAPIDAPI_BASE}/standings"
     params = {
-        "league": league_id,
-        "season": temporada,
+        "season": str(datetime.now(TZ).year),
     }
 
     try:
         r = requests.get(
             url,
-            headers=headers,
+            headers=headers_brasileirao(),
             params=params,
             timeout=20,
         )
@@ -760,55 +729,67 @@ def buscar_classificacao_brasileirao():
     if r.status_code != 200:
         return {}
 
-    dados = r.json()
-
     try:
-        tabela = (
-            dados["response"][0]["league"]["standings"][0]
-        )
+        dados = r.json()
     except Exception:
+        return {}
+
+    if dados.get("error"):
         return {}
 
     posicoes = {}
 
-    for linha in tabela:
-        equipa = linha.get("team", {}).get("name")
-        posicao = linha.get("rank")
+    for linha in dados.get("data", []):
+        equipa = (
+            linha.get("team", {}).get("name")
+            or linha.get("teamName")
+        )
+        posicao = (
+            linha.get("position")
+            or linha.get("rank")
+        )
 
-        if equipa and posicao:
-            posicoes[equipa] = int(posicao)
+        if equipa and posicao is not None:
+            try:
+                posicoes[equipa] = int(posicao)
+            except Exception:
+                pass
 
     return posicoes
 
 
 @st.cache_data(ttl=600, show_spinner=False)
 def buscar_perfil_golos_brasileirao():
-    league_id, temporada, erro = obter_brasileirao_api_info()
+    """
+    Perfil recente para dificuldade de:
+    - ambas marcam
+    - total de golos
+    - golos por equipa
 
-    if erro:
+    O endpoint de lista fornece o placar final.
+    Se não houver informação de intervalo no item, a dificuldade
+    de golos ao intervalo cai para a regra neutra.
+    """
+    if not BRASILEIRAO_API_KEY:
         return {}
 
     agora = datetime.now(TZ)
     data_fim = agora.date()
     data_inicio = (agora - timedelta(days=90)).date()
 
-    url = "https://v3.football.api-sports.io/fixtures"
-    headers = {
-        "x-apisports-key": API_FOOTBALL_KEY,
-    }
+    url = f"{BRASILEIRAO_RAPIDAPI_BASE}/matches"
     params = {
-        "league": league_id,
-        "season": temporada,
+        "season": str(agora.year),
         "from": data_inicio.isoformat(),
         "to": data_fim.isoformat(),
-        "status": "FT",
-        "timezone": "Europe/Lisbon",
+        "status": "finished",
+        "limit": 200,
     }
 
     try:
         r = requests.get(
             url,
-            headers=headers,
+            headers=headers_brasileirao(),
             params=params,
             timeout=20,
         )
@@ -818,42 +799,75 @@ def buscar_perfil_golos_brasileirao():
     if r.status_code != 200:
         return {}
 
-    dados = r.json()
-    perfis = defaultdict(list)
+    try:
+        dados = r.json()
+    except Exception:
+        return {}
 
-    partidas = dados.get("response", [])
+    if dados.get("error"):
+        return {}
+
+    perfis = defaultdict(list)
+    partidas = dados.get("data", [])
 
     partidas.sort(
-        key=lambda p: p.get("fixture", {}).get("date", ""),
+        key=lambda p: p.get("kickoff", ""),
         reverse=True,
     )
 
     for item in partidas:
-        teams = item.get("teams", {})
-        casa = teams.get("home", {}).get("name")
-        fora = teams.get("away", {}).get("name")
+        casa = (
+            item.get("homeTeam", {}).get("name")
+        )
+        fora = (
+            item.get("awayTeam", {}).get("name")
+        )
 
         if not casa or not fora:
             continue
 
-        goals = item.get("goals", {}) or {}
-        gc = goals.get("home")
-        gf = goals.get("away")
+        score = item.get("score", {}) or {}
+        gc = score.get("home")
+        gf = score.get("away")
 
         if gc is None or gf is None:
             continue
 
-        score = item.get("score", {}) or {}
-        half = score.get("halftime", {}) or {}
-        hc = half.get("home")
-        hf = half.get("away")
+        try:
+            gc = int(gc)
+            gf = int(gf)
+        except Exception:
+            continue
+
+        # Algumas respostas podem trazer halftime/halfTime.
+        half = (
+            item.get("halfTime")
+            or item.get("halftime")
+            or score.get("halfTime")
+            or score.get("halftime")
+            or {}
+        )
+
+        hc = (
+            half.get("home")
+            if isinstance(half, dict)
+            else None
+        )
+        hf = (
+            half.get("away")
+            if isinstance(half, dict)
+            else None
+        )
 
         total = gc + gf
         ambas = gc >= 1 and gf >= 1
 
         total_intervalo = None
         if hc is not None and hf is not None:
-            total_intervalo = hc + hf
+            try:
+                total_intervalo = int(hc) + int(hf)
+            except Exception:
+                total_intervalo = None
 
         registo_casa = {
             "marcados": gc,
@@ -876,6 +890,140 @@ def buscar_perfil_golos_brasileirao():
             perfis[fora].append(registo_fora)
 
     return dict(perfis)
+
+
+def _resultado_brasileirao_normalizado(item):
+    """
+    Converte a resposta da RapidAPI para a estrutura usada
+    pelo avaliador já existente da app.
+    """
+    if not item:
+        return None
+
+    status = str(item.get("status", "")).lower()
+
+    score = item.get("score", {}) or {}
+    gc = score.get("home")
+    gf = score.get("away")
+
+    half_home = None
+    half_away = None
+
+    half = (
+        item.get("halfTime")
+        or item.get("halftime")
+        or score.get("halfTime")
+        or score.get("halftime")
+        or {}
+    )
+
+    if isinstance(half, dict):
+        half_home = half.get("home")
+        half_away = half.get("away")
+
+    # Se o detalhe não trouxer placar do intervalo, tentamos
+    # reconstruí-lo pelos eventos de golo até aos 45 minutos.
+    if half_home is None or half_away is None:
+        home_id = item.get("homeTeam", {}).get("id")
+        away_id = item.get("awayTeam", {}).get("id")
+
+        if home_id is not None and away_id is not None:
+            h = 0
+            a = 0
+            encontrou_eventos_golo = False
+
+            for evento in item.get("events", []) or []:
+                if str(evento.get("type", "")).lower() != "goal":
+                    continue
+
+                minuto = evento.get("minute")
+                try:
+                    minuto = int(minuto)
+                except Exception:
+                    continue
+
+                if minuto > 45:
+                    continue
+
+                encontrou_eventos_golo = True
+                team_id = evento.get("teamId")
+
+                if team_id == home_id:
+                    h += 1
+                elif team_id == away_id:
+                    a += 1
+
+            if encontrou_eventos_golo:
+                half_home = h
+                half_away = a
+
+    return {
+        "id": item.get("id"),
+        "status": (
+            "FINISHED"
+            if status == "finished"
+            else status.upper()
+        ),
+        "score": {
+            "regularTime": {
+                "home": gc,
+                "away": gf,
+            },
+            "fullTime": {
+                "home": gc,
+                "away": gf,
+            },
+            "halfTime": {
+                "home": half_home,
+                "away": half_away,
+            },
+        },
+    }
+
+
+def buscar_resultados_brasileirao(match_ids):
+    resultados = {}
+
+    if not match_ids or not BRASILEIRAO_API_KEY:
+        return resultados
+
+    for match_id in match_ids:
+        url = (
+            f"{BRASILEIRAO_RAPIDAPI_BASE}"
+            f"/matches/{match_id}"
+        )
+
+        try:
+            r = requests.get(
+                url,
+                headers=headers_brasileirao(),
+                timeout=20,
+            )
+        except requests.RequestException:
+            continue
+
+        if r.status_code != 200:
+            continue
+
+        try:
+            dados = r.json()
+        except Exception:
+            continue
+
+        if dados.get("error"):
+            continue
+
+        item = dados.get("data")
+        normalizado = _resultado_brasileirao_normalizado(
+            item
+        )
+
+        if normalizado and normalizado.get("id") is not None:
+            resultados[
+                normalizado["id"]
+            ] = normalizado
+
+    return resultados
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -1432,84 +1580,6 @@ def buscar_resultados_api(match_ids):
 
 
 
-def buscar_resultados_api_football(match_ids):
-    resultados = {}
-
-    if not match_ids or not API_FOOTBALL_KEY:
-        return resultados
-
-    headers = {
-        "x-apisports-key": API_FOOTBALL_KEY,
-    }
-
-    # A API aceita até 20 IDs por pedido.
-    ids = [str(x) for x in match_ids if x is not None]
-
-    for inicio in range(0, len(ids), 20):
-        lote = ids[inicio:inicio + 20]
-
-        url = "https://v3.football.api-sports.io/fixtures"
-        params = {
-            "ids": "-".join(lote),
-            "timezone": "Europe/Lisbon",
-        }
-
-        try:
-            r = requests.get(
-                url,
-                headers=headers,
-                params=params,
-                timeout=20,
-            )
-        except requests.RequestException:
-            continue
-
-        if r.status_code != 200:
-            continue
-
-        for item in r.json().get("response", []):
-            fixture = item.get("fixture", {})
-            fixture_id = fixture.get("id")
-            status_short = fixture.get(
-                "status", {}
-            ).get("short")
-
-            terminado = status_short in {
-                "FT", "AET", "PEN",
-            }
-
-            goals = item.get("goals", {}) or {}
-            score = item.get("score", {}) or {}
-            half = score.get("halftime", {}) or {}
-
-            # Estrutura normalizada para reutilizar avaliar_previsao().
-            partida_normalizada = {
-                "id": fixture_id,
-                "status": (
-                    "FINISHED"
-                    if terminado
-                    else status_short
-                ),
-                "score": {
-                    "regularTime": {
-                        "home": goals.get("home"),
-                        "away": goals.get("away"),
-                    },
-                    "fullTime": {
-                        "home": goals.get("home"),
-                        "away": goals.get("away"),
-                    },
-                    "halfTime": {
-                        "home": half.get("home"),
-                        "away": half.get("away"),
-                    },
-                },
-            }
-
-            resultados[fixture_id] = partida_normalizada
-
-    return resultados
-
 
 def atualizar_previsao_admin(
     previsao_id,
@@ -1664,17 +1734,18 @@ def atualizar_resultados_automaticamente():
         return 0
 
     pendentes_football_data = []
-    pendentes_api_football = []
+    pendentes_brasileirao = []
 
     for p in pendentes:
         fonte = p.get("fonte_api")
 
-        # Compatibilidade com previsões antigas.
+        # O nome da liga também serve como fallback para
+        # previsões antigas guardadas antes desta mudança.
         if (
-            fonte == "api_football"
+            fonte == "rapidapi_brasileirao"
             or p.get("liga") == "Brasileirão Série A"
         ):
-            pendentes_api_football.append(p)
+            pendentes_brasileirao.append(p)
         else:
             pendentes_football_data.append(p)
 
@@ -1684,9 +1755,9 @@ def atualizar_resultados_automaticamente():
         if p.get("match_id") is not None
     })
 
-    ids_api_football = list({
+    ids_brasileirao = list({
         p["match_id"]
-        for p in pendentes_api_football
+        for p in pendentes_brasileirao
         if p.get("match_id") is not None
     })
 
@@ -1694,8 +1765,8 @@ def atualizar_resultados_automaticamente():
         ids_football_data
     )
 
-    resultados_br = buscar_resultados_api_football(
-        ids_api_football
+    resultados_br = buscar_resultados_brasileirao(
+        ids_brasileirao
     )
 
     atualizados = 0
@@ -1704,7 +1775,7 @@ def atualizar_resultados_automaticamente():
         fonte = previsao.get("fonte_api")
 
         if (
-            fonte == "api_football"
+            fonte == "rapidapi_brasileirao"
             or previsao.get("liga") == "Brasileirão Série A"
         ):
             partida = resultados_br.get(
@@ -2479,7 +2550,7 @@ with tab_prever:
                 and (
                     p.get("fonte_api")
                     or (
-                        "api_football"
+                        "rapidapi_brasileirao"
                         if p.get("liga") == "Brasileirão Série A"
                         else "football_data"
                     )
@@ -2804,7 +2875,7 @@ with tab_minhas:
             chave_jogo = (
                 p.get("fonte_api")
                 or (
-                    "api_football"
+                    "rapidapi_brasileirao"
                     if p.get("liga") == "Brasileirão Série A"
                     else "football_data"
                 ),
@@ -3137,7 +3208,7 @@ with tab_historico:
                 chave_hist = (
                     p.get("fonte_api")
                     or (
-                        "api_football"
+                        "rapidapi_brasileirao"
                         if p.get("liga") == "Brasileirão Série A"
                         else "football_data"
                     ),
