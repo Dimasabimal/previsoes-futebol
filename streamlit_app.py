@@ -2418,6 +2418,14 @@ def buscar_lutas_mma():
 
             peso = luta.get("weight_class") or ""
             titulo = bool(luta.get("is_title"))
+            main_event = bool(luta.get("is_main"))
+
+            # A UFCalendar inclui no próprio card o ranking oficial
+            # e a sequência atual de cada lutador.
+            rank1 = fighter_a.get("rank")
+            rank2 = fighter_b.get("rank")
+            streak1 = fighter_a.get("streak")
+            streak2 = fighter_b.get("streak")
 
             lutas.append({
                 "evento_id": str(fight_id),
@@ -2430,7 +2438,12 @@ def buscar_lutas_mma():
                 "fonte_api": "ufcalendar",
                 "modalidade": "MMA",
                 "categoria": peso,
-                "is_main": titulo,
+                "is_title": titulo,
+                "is_main": main_event,
+                "rank_casa": rank1,
+                "rank_fora": rank2,
+                "streak_casa": streak1,
+                "streak_fora": streak2,
             })
 
     lutas.sort(
@@ -2446,10 +2459,129 @@ def buscar_lutas_mma():
     return lutas[:100], None
 
 
+def _rank_mma_valido(valor):
+    try:
+        if valor is None:
+            return None
+        return int(valor)
+    except (TypeError, ValueError):
+        return None
+
+
+def _streak_mma_valido(valor):
+    try:
+        if valor is None:
+            return 0
+        return int(valor)
+    except (TypeError, ValueError):
+        return 0
+
+
 def dificuldade_mma(luta, valor):
-    # Primeira versão: dificuldade neutra.
-    # Depois podemos melhorar com rankings/records sem usar odds.
+    """
+    Dificuldade baseada apenas em dados desportivos:
+    ranking oficial UFC + sequência atual.
+    Não usa odds.
+    """
+
+    if valor == "Lutador1":
+        rank_escolhido = _rank_mma_valido(
+            luta.get("rank_casa")
+        )
+        rank_adversario = _rank_mma_valido(
+            luta.get("rank_fora")
+        )
+        streak_escolhido = _streak_mma_valido(
+            luta.get("streak_casa")
+        )
+        streak_adversario = _streak_mma_valido(
+            luta.get("streak_fora")
+        )
+    else:
+        rank_escolhido = _rank_mma_valido(
+            luta.get("rank_fora")
+        )
+        rank_adversario = _rank_mma_valido(
+            luta.get("rank_casa")
+        )
+        streak_escolhido = _streak_mma_valido(
+            luta.get("streak_fora")
+        )
+        streak_adversario = _streak_mma_valido(
+            luta.get("streak_casa")
+        )
+
+    score = 0
+
+    # Ranking: 0 = campeão, números menores = melhor posição.
+    if (
+        rank_escolhido is not None
+        and rank_adversario is not None
+    ):
+        diferenca = rank_escolhido - rank_adversario
+
+        if diferenca >= 8:
+            score += 3
+        elif diferenca >= 4:
+            score += 2
+        elif diferenca >= 2:
+            score += 1
+        elif diferenca <= -8:
+            score -= 2
+        elif diferenca <= -4:
+            score -= 1
+
+    elif (
+        rank_escolhido is None
+        and rank_adversario is not None
+    ):
+        score += 2
+
+    elif (
+        rank_escolhido is not None
+        and rank_adversario is None
+    ):
+        score -= 1
+
+    # Sequência: streak positivo = vitórias; negativo = derrotas.
+    diferenca_streak = streak_adversario - streak_escolhido
+
+    if diferenca_streak >= 4:
+        score += 2
+    elif diferenca_streak >= 2:
+        score += 1
+    elif diferenca_streak <= -4:
+        score -= 1
+
+    if score >= 4:
+        return "Muito difícil", 2.5
+    if score >= 2:
+        return "Difícil", 2.0
+    if score <= -2:
+        return "Fácil", 1.0
+
     return "Média", 1.5
+
+
+
+
+def texto_rank_mma(rank):
+    rank = _rank_mma_valido(rank)
+    if rank is None:
+        return "Não ranqueado"
+    if rank == 0:
+        return "Campeão"
+    return f"#{rank}"
+
+
+def texto_streak_mma(streak):
+    streak = _streak_mma_valido(streak)
+    if streak > 0:
+        return f"{streak} vitórias seguidas"
+    if streak < 0:
+        return f"{abs(streak)} derrotas seguidas"
+    return "Sem sequência"
+
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -3793,6 +3925,8 @@ with tab_prever:
                 "Escolhe a luta",
                 options=range(len(lutas_mma)),
                 format_func=lambda i: (
+                    f"{'⭐ ' if lutas_mma[i].get('is_main') else ''}"
+                    f"{'🏆 ' if lutas_mma[i].get('is_title') else ''}"
                     f"{lutas_mma[i]['data']} — "
                     f"{lutas_mma[i]['jogo']} "
                     f"({lutas_mma[i]['categoria']})"
@@ -3801,6 +3935,39 @@ with tab_prever:
             )
 
             luta = lutas_mma[indice_mma]
+
+            etiquetas = []
+            if luta.get("is_main"):
+                etiquetas.append("⭐ Main Event")
+            if luta.get("is_title"):
+                etiquetas.append("🏆 Luta de título")
+
+            if etiquetas:
+                st.markdown(" • ".join(etiquetas))
+
+            st.caption(
+                f"🥋 {luta.get('categoria') or 'Categoria não indicada'}"
+            )
+
+            col_mma_a, col_mma_b = st.columns(2)
+
+            with col_mma_a:
+                st.markdown(f"**{luta['casa']}**")
+                st.write(
+                    f"Ranking: {texto_rank_mma(luta.get('rank_casa'))}"
+                )
+                st.caption(
+                    texto_streak_mma(luta.get("streak_casa"))
+                )
+
+            with col_mma_b:
+                st.markdown(f"**{luta['fora']}**")
+                st.write(
+                    f"Ranking: {texto_rank_mma(luta.get('rank_fora'))}"
+                )
+                st.caption(
+                    texto_streak_mma(luta.get("streak_fora"))
+                )
 
             existentes_mma = [
                 p for p in minhas
@@ -3853,7 +4020,9 @@ with tab_prever:
                 f"Se acertar: **"
                 f"{formatar_pontos(confianca_mma * multiplicador_mma)} "
                 f"pontos** • "
-                f"Se errar: **-{confianca_mma} pontos**"
+                f"Se errar: **-{confianca_mma} pontos**\n\n"
+                f"_Dificuldade calculada pelo ranking oficial e "
+                f"pela sequência recente dos lutadores._"
             )
 
             if st.button(
