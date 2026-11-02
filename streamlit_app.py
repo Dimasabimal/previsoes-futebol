@@ -1236,16 +1236,9 @@ def buscar_perfil_golos_liga(nome_liga):
     if nome_liga == "Brasileirão Série A":
         return buscar_perfil_golos_brasileirao()
 
-    """
-    Usa jogos FINALIZADOS recentes da competição para criar
-    um perfil simples de golos de cada equipa.
-
-    Guardamos, para cada equipa, até aos 8 jogos mais recentes:
-    - golos marcados
-    - total de golos do jogo
-    - total de golos ao intervalo
-    - se ambas marcaram
-    """
+    # Usa jogos finalizados recentes da competição para criar
+    # internamente um perfil simples de golos por equipa.
+    # Estes comentários não aparecem na interface.
     codigo = LIGAS[nome_liga]
 
     agora = datetime.now(TZ)
