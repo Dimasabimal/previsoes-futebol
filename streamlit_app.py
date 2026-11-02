@@ -1890,23 +1890,20 @@ def buscar_jogos_tenis(circuito):
             "nos Secrets do Streamlit."
         )
 
-    # Endpoint correto para os próximos encontros.
-    url = f"{TENNIS_API_BASE}/matches/upcoming"
+    # Para previsões futuras usamos /matches com filtros explícitos.
+    url = f"{TENNIS_API_BASE}/matches"
 
     agora = datetime.now(TZ)
-    limite = agora + timedelta(days=2)
+    limite = agora + timedelta(days=30)
 
-    circuito_api = (
-        "atp"
-        if circuito == "ATP"
-        else "wta"
-    )
+    circuito_api = "atp" if circuito == "ATP" else "wta"
 
     params = {
         "from": agora.date().isoformat(),
         "to": limite.date().isoformat(),
         "circuit": circuito_api,
         "doubles": "false",
+        "status": "scheduled",
         "limit": 100,
     }
 
@@ -1930,29 +1927,13 @@ def buscar_jogos_tenis(circuito):
 
     itens = _lista_tennis(dados)
 
-    estados_finais = {
-        "completed",
-        "finished",
-        "final",
-        "retired",
-        "walkover",
-        "defaulted",
-        "abandoned",
-        "cancelled",
-        "canceled",
-    }
-
     jogos = []
 
     for item in itens:
         if not isinstance(item, dict):
             continue
 
-        status = _status_tennis(item)
-
-        if status in estados_finais:
-            continue
-
+        # Apenas o circuito escolhido.
         circuito_item = str(
             item.get("circuit") or ""
         ).strip().lower()
@@ -1960,7 +1941,12 @@ def buscar_jogos_tenis(circuito):
         if circuito_item != circuito_api:
             continue
 
+        # Apenas singles.
         if item.get("doubles") is True:
+            continue
+
+        status = _status_tennis(item)
+        if status not in {"scheduled", "unknown", ""}:
             continue
 
         dt = _parse_data_tennis(item)
@@ -1968,7 +1954,7 @@ def buscar_jogos_tenis(circuito):
         if dt is None:
             continue
 
-        if dt < agora - timedelta(hours=2):
+        if dt < agora or dt > limite:
             continue
 
         p1, p2 = _players_tennis(item)
@@ -2022,89 +2008,6 @@ def buscar_jogos_tenis(circuito):
         jogo.pop("data_obj", None)
 
     return jogos[:50], None
-
-
-
-@st.cache_data(ttl=60, show_spinner=False)
-def diagnostico_upcoming_tennis(circuito):
-    """
-    Diagnóstico seguro do endpoint /matches/upcoming.
-    Não mostra a chave de API.
-    """
-    if not TENNIS_API_KEY:
-        return {"erro": "TENNIS_API_KEY não configurada."}
-
-    agora = datetime.now(TZ)
-    limite = agora + timedelta(days=2)
-
-    circuito_api = "atp" if circuito == "ATP" else "wta"
-
-    url = f"{TENNIS_API_BASE}/matches/upcoming"
-    params = {
-        "from": agora.date().isoformat(),
-        "to": limite.date().isoformat(),
-        "circuit": circuito_api,
-        "doubles": "false",
-        "limit": 100,
-    }
-
-    try:
-        r = requests.get(
-            url,
-            headers=headers_tennis(),
-            params=params,
-            timeout=20,
-        )
-    except requests.RequestException as erro:
-        return {"erro": f"Erro de ligação: {erro}"}
-
-    info = {
-        "status_http": r.status_code,
-        "endpoint": "/v1/matches/upcoming",
-        "circuito_pedido": circuito_api,
-        "from": params["from"],
-        "to": params["to"],
-    }
-
-    try:
-        dados = r.json()
-    except Exception:
-        info["resposta_texto"] = r.text[:1500]
-        return info
-
-    if isinstance(dados, dict):
-        info["campos_topo"] = list(dados.keys())
-        info["meta"] = dados.get("meta")
-
-        lista = _lista_tennis(dados)
-        info["quantidade_itens"] = len(lista)
-
-        exemplos = []
-        for item in lista[:5]:
-            if not isinstance(item, dict):
-                exemplos.append(str(item))
-                continue
-
-            lados = item.get("sides")
-            exemplos.append({
-                "id": item.get("id"),
-                "date": item.get("date"),
-                "status": item.get("status"),
-                "circuit": item.get("circuit"),
-                "doubles": item.get("doubles"),
-                "campos_item": list(item.keys()),
-                "sides": lados,
-                "players": item.get("players"),
-                "player1": item.get("player1"),
-                "player2": item.get("player2"),
-            })
-
-        info["exemplos"] = exemplos
-    else:
-        info["tipo_resposta"] = type(dados).__name__
-        info["resposta"] = dados
-
-    return info
 
 
 def dificuldade_tenis(jogo, valor):
@@ -3295,15 +3198,9 @@ with tab_prever:
         if not jogos_tenis and not erro_tenis:
             st.info(
                 "Não encontrei encontros futuros de "
-                f"{circuito} nos próximos 2 dias."
+                f"{circuito} nos próximos 30 dias."
             )
 
-            with st.expander("🔧 Diagnóstico do endpoint upcoming"):
-                st.caption(
-                    "Não mostra a tua chave. "
-                    "Mostra apenas a resposta do endpoint."
-                )
-                st.json(diagnostico_upcoming_tennis(circuito))
 
 
 
