@@ -25,6 +25,7 @@ FOOTBALL_API_KEY = st.secrets["FOOTBALL_API_KEY"]
 BRASILEIRAO_API_KEY = st.secrets.get("BRASILEIRAO_API_KEY", "")
 TENNIS_API_KEY = st.secrets.get("TENNIS_API_KEY", "")
 MMA_API_KEY = st.secrets.get("MMA_API_KEY", "")
+UFC_API_KEY = st.secrets.get("UFC_API_KEY", "")
 
 # Cookie encriptado para manter a sessão iniciada entre visitas.
 # A chave privada do servidor é usada apenas como palavra-passe de encriptação.
@@ -2285,77 +2286,96 @@ def buscar_resultado_tenis(evento_id):
 
 
 # =========================================================
-# API MMA / UFC
+# UFC / MMA — UFCALENDAR FIGHT API
 # =========================================================
 
-MMA_API_BASE = "https://v1.mma.api-sports.io"
+UFC_API_BASE = "https://api.ufcalendar.com/v1"
 
 
-def headers_mma():
+def headers_ufc():
     return {
-        "x-apisports-key": MMA_API_KEY,
+        "Authorization": f"Bearer {UFC_API_KEY}",
         "Accept": "application/json",
     }
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
 def buscar_lutas_mma():
-    if not MMA_API_KEY:
+    if not UFC_API_KEY:
         return [], (
-            "MMA_API_KEY não está configurada "
+            "UFC_API_KEY não está configurada "
             "nos Secrets do Streamlit."
         )
 
-    url = f"{MMA_API_BASE}/fights"
-    params = {
-        "season": datetime.now(TZ).year,
-        "timezone": "Europe/Lisbon",
-    }
-
+    # 1) Próximos eventos UFC
     try:
         r = requests.get(
-            url,
-            headers=headers_mma(),
-            params=params,
+            f"{UFC_API_BASE}/events",
+            headers=headers_ufc(),
+            params={
+                "org": "ufc",
+                "status": "upcoming",
+                "limit": 5,
+            },
             timeout=20,
         )
     except requests.RequestException as erro:
-        return [], f"Erro de ligação à API MMA: {erro}"
+        return [], f"Erro de ligação à Fight API: {erro}"
 
     if r.status_code != 200:
-        return [], f"Erro API MMA: {r.status_code}"
+        return [], f"Erro Fight API: {r.status_code}"
 
     try:
         dados = r.json()
     except Exception:
-        return [], "A API MMA devolveu uma resposta inválida."
+        return [], "A Fight API devolveu uma resposta inválida."
 
-    erros = dados.get("errors")
-    if erros:
-        return [], f"API MMA: {erros}"
+    eventos = dados.get("data") or []
+    if not isinstance(eventos, list):
+        eventos = []
 
     agora = datetime.now(TZ)
-    limite = agora + timedelta(days=60)
-
     lutas = []
 
-    for item in dados.get("response", []):
-        if not isinstance(item, dict):
+    # 2) Buscar o card completo de cada evento.
+    # Limitamos a 5 eventos e usamos cache de 6h para poupar o plano gratuito.
+    for evento in eventos[:5]:
+        if not isinstance(evento, dict):
             continue
 
-        status = item.get("status") or {}
-        status_short = str(
-            status.get("short") or ""
-        ).upper()
-
-        if status_short not in {"NS", "PF", "IN"}:
+        slug = evento.get("slug")
+        if not slug:
             continue
 
-        slug = str(item.get("slug") or "")
-        if "ufc" not in slug.lower():
+        try:
+            revent = requests.get(
+                f"{UFC_API_BASE}/events/{slug}",
+                headers=headers_ufc(),
+                timeout=20,
+            )
+        except requests.RequestException:
             continue
 
-        valor_data = item.get("date")
+        if revent.status_code != 200:
+            continue
+
+        try:
+            detalhe = revent.json().get("data") or {}
+        except Exception:
+            continue
+
+        titulo_evento = (
+            detalhe.get("title")
+            or evento.get("title")
+            or evento.get("short_title")
+            or "UFC"
+        )
+
+        valor_data = (
+            detalhe.get("starts_at")
+            or evento.get("starts_at")
+        )
+
         if not valor_data:
             continue
 
@@ -2369,36 +2389,49 @@ def buscar_lutas_mma():
         except Exception:
             continue
 
-        if dt <= agora or dt > limite:
+        # Não mostrar eventos já passados.
+        if dt < agora - timedelta(hours=8):
             continue
 
-        fighters = item.get("fighters") or {}
-        first = fighters.get("first") or {}
-        second = fighters.get("second") or {}
+        card = detalhe.get("card") or []
 
-        nome1 = first.get("name")
-        nome2 = second.get("name")
+        for luta in card:
+            if not isinstance(luta, dict):
+                continue
 
-        if not nome1 or not nome2:
-            continue
+            # Se já tem resultado, não é previsão futura.
+            if luta.get("result"):
+                continue
 
-        luta_id = item.get("id")
-        if luta_id is None:
-            continue
+            fighter_a = luta.get("fighter_a") or {}
+            fighter_b = luta.get("fighter_b") or {}
 
-        lutas.append({
-            "evento_id": str(luta_id),
-            "jogo": f"{nome1} vs {nome2}",
-            "casa": nome1,
-            "fora": nome2,
-            "liga": slug or "UFC",
-            "data": dt.strftime("%d/%m/%Y %H:%M"),
-            "data_obj": dt,
-            "fonte_api": "api_mma",
-            "modalidade": "MMA",
-            "categoria": item.get("category") or "",
-            "is_main": bool(item.get("is_main")),
-        })
+            nome1 = fighter_a.get("name")
+            nome2 = fighter_b.get("name")
+
+            if not nome1 or not nome2:
+                continue
+
+            fight_id = luta.get("id")
+            if fight_id is None:
+                continue
+
+            peso = luta.get("weight_class") or ""
+            titulo = bool(luta.get("is_title"))
+
+            lutas.append({
+                "evento_id": str(fight_id),
+                "jogo": f"{nome1} vs {nome2}",
+                "casa": nome1,
+                "fora": nome2,
+                "liga": titulo_evento,
+                "data": dt.strftime("%d/%m/%Y %H:%M"),
+                "data_obj": dt,
+                "fonte_api": "ufcalendar",
+                "modalidade": "MMA",
+                "categoria": peso,
+                "is_main": titulo,
+            })
 
     lutas.sort(
         key=lambda x: (
@@ -2410,27 +2443,24 @@ def buscar_lutas_mma():
     for luta in lutas:
         luta.pop("data_obj", None)
 
-    return lutas[:80], None
+    return lutas[:100], None
 
 
 def dificuldade_mma(luta, valor):
     # Primeira versão: dificuldade neutra.
-    # Evita chamadas extra à API por lutador.
+    # Depois podemos melhorar com rankings/records sem usar odds.
     return "Média", 1.5
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def buscar_resultado_mma(evento_id):
-    if not MMA_API_KEY or not evento_id:
+    if not UFC_API_KEY or not evento_id:
         return None
-
-    url = f"{MMA_API_BASE}/fights"
 
     try:
         r = requests.get(
-            url,
-            headers=headers_mma(),
-            params={"id": evento_id},
+            f"{UFC_API_BASE}/fights/{evento_id}",
+            headers=headers_ufc(),
             timeout=20,
         )
     except requests.RequestException:
@@ -2440,50 +2470,55 @@ def buscar_resultado_mma(evento_id):
         return None
 
     try:
-        dados = r.json()
+        luta = r.json().get("data") or {}
     except Exception:
         return None
 
-    resposta = dados.get("response") or []
-    if not resposta:
-        return None
-
-    item = resposta[0]
-    status = item.get("status") or {}
-    status_short = str(
-        status.get("short") or ""
-    ).upper()
-
-    if status_short != "FT":
+    resultado = luta.get("result")
+    if not resultado:
         return {"status": "PENDING"}
 
-    fighters = item.get("fighters") or {}
-    first = fighters.get("first") or {}
-    second = fighters.get("second") or {}
+    fighter_a = luta.get("fighter_a") or {}
+    fighter_b = luta.get("fighter_b") or {}
 
-    vencedor_indice = None
+    id_a = fighter_a.get("id")
+    id_b = fighter_b.get("id")
+    winner_id = resultado.get("winner_fighter_id")
 
-    if first.get("winner") is True:
-        vencedor_indice = 0
-    elif second.get("winner") is True:
-        vencedor_indice = 1
-
-    if vencedor_indice is None:
+    if winner_id is None:
         return None
 
-    vencedor_nome = (
-        first.get("name")
-        if vencedor_indice == 0
-        else second.get("name")
-    )
+    vencedor_indice = None
+    vencedor_nome = ""
+
+    if str(winner_id) == str(id_a):
+        vencedor_indice = 0
+        vencedor_nome = fighter_a.get("name") or ""
+    elif str(winner_id) == str(id_b):
+        vencedor_indice = 1
+        vencedor_nome = fighter_b.get("name") or ""
+    else:
+        # Draw / no contest
+        return None
+
+    metodo = resultado.get("method") or ""
+    round_n = resultado.get("round")
+    tempo = resultado.get("time") or ""
+
+    partes = [metodo]
+    if round_n is not None:
+        partes.append(f"R{round_n}")
+    if tempo:
+        partes.append(str(tempo))
+
+    placar = " · ".join(p for p in partes if p)
 
     return {
         "status": "FINISHED",
         "winner_index": vencedor_indice,
-        "winner_name": vencedor_nome or "",
-        "placar": "",
+        "winner_name": vencedor_nome,
+        "placar": placar,
     }
-
 
 
 # =========================================================
@@ -2696,7 +2731,7 @@ def atualizar_resultados_automaticamente():
         fonte = p.get("fonte_api")
         modalidade = modalidade_previsao(p)
 
-        if modalidade == "MMA" or fonte == "api_mma":
+        if modalidade == "MMA" or fonte in {"api_mma", "ufcalendar"}:
             if jogo_comecou(p):
                 pendentes_mma.append(p)
         elif modalidade == "Ténis" or fonte == "api_tennis":
@@ -3740,7 +3775,7 @@ with tab_prever:
                             st.code(r.text)
 
     elif modalidade == "🥋 MMA/UFC":
-        with st.spinner("A carregar lutas UFC..."):
+        with st.spinner("A carregar o próximo card UFC..."):
             lutas_mma, erro_mma = buscar_lutas_mma()
 
         if erro_mma:
@@ -3851,7 +3886,7 @@ with tab_prever:
                         "match_id":
                             None,
                         "fonte_api":
-                            "api_mma",
+                            "ufcalendar",
                         "jogo":
                             luta["jogo"],
                         "casa":
