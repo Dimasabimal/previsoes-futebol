@@ -1,5 +1,6 @@
 import streamlit as st
 import requests
+import time
 import re
 import unicodedata
 from datetime import datetime, timedelta
@@ -1561,6 +1562,59 @@ def dificuldade_previsao(
 # API DE TÉNIS
 # =========================================================
 
+
+def tennis_get(url, params=None, timeout=20):
+    """
+    Faz uma chamada GET à api.tennis com proteção contra 429.
+    - tenta uma vez
+    - se receber 429, respeita Retry-After
+    - espera pelo menos 1 segundo
+    - repete apenas uma vez
+    """
+    headers = headers_tennis()
+
+    try:
+        r = requests.get(
+            url,
+            headers=headers,
+            params=params,
+            timeout=timeout,
+        )
+    except requests.RequestException as erro:
+        return None, f"Erro de ligação à API Tennis: {erro}"
+
+    if r.status_code != 429:
+        return r, None
+
+    retry_after = r.headers.get("Retry-After")
+
+    try:
+        espera = float(retry_after) if retry_after else 1.2
+    except Exception:
+        espera = 1.2
+
+    espera = max(1.0, min(espera, 5.0))
+    time.sleep(espera)
+
+    try:
+        r2 = requests.get(
+            url,
+            headers=headers,
+            params=params,
+            timeout=timeout,
+        )
+    except requests.RequestException as erro:
+        return None, f"Erro de ligação à API Tennis: {erro}"
+
+    if r2.status_code == 429:
+        return r2, (
+            "A API Tennis está a limitar pedidos por segundo. "
+            "Espera alguns segundos e tenta novamente."
+        )
+
+    return r2, None
+
+
 TENNIS_API_BASE = "https://api.tennis/v1"
 
 
@@ -1897,7 +1951,7 @@ def _status_tennis(item):
     return str(status or "").strip().lower()
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=21600, show_spinner=False)
 def buscar_jogos_tenis(circuito):
     if not TENNIS_API_KEY:
         return [], (
@@ -1925,15 +1979,17 @@ def buscar_jogos_tenis(circuito):
         "limit": 100,
     }
 
-    try:
-        r = requests.get(
-            url,
-            headers=headers_tennis(),
-            params=params,
-            timeout=20,
-        )
-    except requests.RequestException as erro:
-        return [], f"Erro de ligação à API Tennis: {erro}"
+    r, erro_rate = tennis_get(
+        url,
+        params=params,
+        timeout=20,
+    )
+
+    if erro_rate:
+        return [], erro_rate
+
+    if r is None:
+        return [], "Não foi possível consultar a API Tennis."
 
     if r.status_code != 200:
         return [], f"Erro API Tennis: {r.status_code}"
@@ -2062,20 +2118,19 @@ def dificuldade_tenis(jogo, valor):
     return "Muito difícil", 3.0
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False)
 def buscar_resultado_tenis(evento_id):
     if not TENNIS_API_KEY or not evento_id:
         return None
 
     url = f"{TENNIS_API_BASE}/matches/{evento_id}"
 
-    try:
-        r = requests.get(
-            url,
-            headers=headers_tennis(),
-            timeout=20,
-        )
-    except requests.RequestException:
+    r, erro_rate = tennis_get(
+        url,
+        timeout=20,
+    )
+
+    if erro_rate or r is None:
         return None
 
     if r.status_code != 200:
@@ -3221,7 +3276,13 @@ with tab_prever:
             jogos_tenis, erro_tenis = buscar_jogos_tenis(circuito)
 
         if erro_tenis:
-            st.error(erro_tenis)
+            if "limitar pedidos" in erro_tenis.lower():
+                st.warning(
+                    "⏳ A API Tennis está a receber pedidos demasiado depressa. "
+                    "Espera alguns segundos e tenta novamente."
+                )
+            else:
+                st.error(erro_tenis)
             jogos_tenis = []
 
         if not jogos_tenis and not erro_tenis:
