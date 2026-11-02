@@ -12,7 +12,7 @@ from st_cookie_manager import EncryptedCookieManager
 # =========================================================
 
 st.set_page_config(
-    page_title="Previsões de Futebol",
+    page_title="Previsões Desportivas",
     page_icon="⚽",
     layout="wide"
 )
@@ -22,6 +22,7 @@ SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
 SUPABASE_SECRET_KEY = st.secrets["SUPABASE_SECRET_KEY"]
 FOOTBALL_API_KEY = st.secrets["FOOTBALL_API_KEY"]
 BRASILEIRAO_API_KEY = st.secrets.get("BRASILEIRAO_API_KEY", "")
+TENNIS_API_KEY = st.secrets.get("TENNIS_API_KEY", "")
 
 # Cookie encriptado para manter a sessão iniciada entre visitas.
 # A chave privada do servidor é usada apenas como palavra-passe de encriptação.
@@ -53,6 +54,7 @@ NOMES_TIPOS = {
     "golos_equipa_fora": "Golos — equipa visitante",
     "ambas_marcam": "Ambas as equipas marcam",
     "dupla_possibilidade": "Dupla possibilidade",
+    "tenis_vencedor": "Vencedor do encontro",
 }
 
 MINIMO_RANKING_PRECISAO = 10
@@ -106,6 +108,20 @@ def jogo_comecou(previsao_ou_jogo):
     if data is None:
         return False
     return datetime.now(TZ) >= data
+
+
+
+def modalidade_previsao(p):
+    return p.get("modalidade") or "Futebol"
+
+
+def chave_evento(p):
+    return (
+        modalidade_previsao(p),
+        p.get("fonte_api") or "",
+        p.get("evento_id") or p.get("match_id"),
+    )
+
 
 
 def calcular_pontos(previsao):
@@ -278,6 +294,14 @@ def melhor_liga(lista):
 
 
 def equipa_associada_previsao(p):
+    if modalidade_previsao(p) == "Ténis":
+        valor = p.get("valor_previsao")
+        if valor == "Jogador1":
+            return p.get("casa")
+        if valor == "Jogador2":
+            return p.get("fora")
+        return None
+
     """Devolve apenas a equipa realmente associada à previsão."""
     tipo = p.get("tipo_previsao")
     valor = p.get("valor_previsao")
@@ -1532,6 +1556,461 @@ def dificuldade_previsao(
     return "Média", 1.5
 
 
+
+# =========================================================
+# API DE TÉNIS
+# =========================================================
+
+TENNIS_API_BASE = "https://api.tennis/v1"
+
+
+def headers_tennis():
+    # O dashboard atual da api.tennis mostra X-API-Key.
+    # Também enviamos Bearer para manter compatibilidade com a
+    # documentação pública mais recente.
+    return {
+        "X-API-Key": TENNIS_API_KEY,
+        "Authorization": f"Bearer {TENNIS_API_KEY}",
+        "Accept": "application/json",
+    }
+
+
+def _lista_tennis(dados):
+    if isinstance(dados, list):
+        return dados
+
+    if isinstance(dados, dict):
+        for chave in ["matches", "data", "results", "response"]:
+            valor = dados.get(chave)
+            if isinstance(valor, list):
+                return valor
+
+        # Alguns endpoints devolvem um único encontro.
+        if any(
+            chave in dados
+            for chave in ["match_id", "id", "players", "player1"]
+        ):
+            return [dados]
+
+    return []
+
+
+def _nome_torneio_tennis(item):
+    torneio = item.get("tournament")
+    if isinstance(torneio, dict):
+        return (
+            torneio.get("name")
+            or torneio.get("title")
+            or "Torneio"
+        )
+    if torneio:
+        return str(torneio)
+
+    comp = item.get("competition")
+    if isinstance(comp, dict):
+        return comp.get("name") or "Torneio"
+    if comp:
+        return str(comp)
+
+    return "Torneio"
+
+
+def _players_tennis(item):
+    jogadores = item.get("players")
+
+    if isinstance(jogadores, list) and len(jogadores) >= 2:
+        p1 = jogadores[0]
+        p2 = jogadores[1]
+
+        if not isinstance(p1, dict):
+            p1 = {"name": str(p1)}
+        if not isinstance(p2, dict):
+            p2 = {"name": str(p2)}
+
+        return p1, p2
+
+    p1 = (
+        item.get("player1")
+        or item.get("home")
+        or item.get("first_player")
+    )
+    p2 = (
+        item.get("player2")
+        or item.get("away")
+        or item.get("second_player")
+    )
+
+    if p1 and p2:
+        if not isinstance(p1, dict):
+            p1 = {"name": str(p1)}
+        if not isinstance(p2, dict):
+            p2 = {"name": str(p2)}
+        return p1, p2
+
+    return None, None
+
+
+def _rank_tennis(player):
+    if not isinstance(player, dict):
+        return None
+
+    for chave in ["rank", "ranking", "position"]:
+        valor = player.get(chave)
+        if isinstance(valor, dict):
+            valor = valor.get("position") or valor.get("rank")
+        try:
+            if valor is not None:
+                return int(valor)
+        except Exception:
+            pass
+
+    return None
+
+
+def _parse_data_tennis(item):
+    candidatos = [
+        item.get("start_time"),
+        item.get("scheduled_at"),
+        item.get("scheduled"),
+        item.get("start_at"),
+        item.get("datetime"),
+        item.get("date"),
+    ]
+
+    for valor in candidatos:
+        if not valor:
+            continue
+
+        # Data isolada + hora isolada.
+        if (
+            isinstance(valor, str)
+            and len(valor) == 10
+            and item.get("time")
+        ):
+            valor = f"{valor}T{item.get('time')}"
+
+        try:
+            dt = datetime.fromisoformat(
+                str(valor).replace("Z", "+00:00")
+            )
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=TZ)
+            return dt.astimezone(TZ)
+        except Exception:
+            pass
+
+        for formato in [
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d %H:%M",
+            "%d/%m/%Y %H:%M",
+        ]:
+            try:
+                return datetime.strptime(
+                    str(valor),
+                    formato,
+                ).replace(tzinfo=TZ)
+            except Exception:
+                pass
+
+    return None
+
+
+def _tour_tennis(item):
+    valores = [
+        item.get("tour"),
+        item.get("category"),
+        item.get("gender"),
+        item.get("circuit"),
+    ]
+
+    torneio = item.get("tournament")
+    if isinstance(torneio, dict):
+        valores.extend([
+            torneio.get("tour"),
+            torneio.get("category"),
+            torneio.get("gender"),
+        ])
+
+    texto = " ".join(
+        str(v) for v in valores if v
+    ).lower()
+
+    if "wta" in texto or "women" in texto or "female" in texto:
+        return "WTA"
+    if "atp" in texto or "men" in texto or "male" in texto:
+        return "ATP"
+
+    return None
+
+
+def _status_tennis(item):
+    status = item.get("status")
+    if isinstance(status, dict):
+        status = (
+            status.get("name")
+            or status.get("short")
+            or status.get("status")
+        )
+    return str(status or "").strip().lower()
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def buscar_jogos_tenis(circuito):
+    if not TENNIS_API_KEY:
+        return [], (
+            "TENNIS_API_KEY não está configurada "
+            "nos Secrets do Streamlit."
+        )
+
+    url = f"{TENNIS_API_BASE}/matches"
+
+    try:
+        r = requests.get(
+            url,
+            headers=headers_tennis(),
+            timeout=20,
+        )
+    except requests.RequestException as erro:
+        return [], f"Erro de ligação à API Tennis: {erro}"
+
+    if r.status_code != 200:
+        return [], f"Erro API Tennis: {r.status_code}"
+
+    try:
+        dados = r.json()
+    except Exception:
+        return [], "A API Tennis devolveu uma resposta inválida."
+
+    agora = datetime.now(TZ)
+    limite = agora + timedelta(days=14)
+
+    estados_finais = {
+        "finished",
+        "final",
+        "completed",
+        "complete",
+        "retired",
+        "walkover",
+        "cancelled",
+        "canceled",
+    }
+
+    jogos = []
+
+    for item in _lista_tennis(dados):
+        if not isinstance(item, dict):
+            continue
+
+        status = _status_tennis(item)
+        if status in estados_finais:
+            continue
+
+        dt = _parse_data_tennis(item)
+        if dt is None or dt <= agora or dt > limite:
+            continue
+
+        tour = _tour_tennis(item)
+        if tour and tour != circuito:
+            continue
+
+        p1, p2 = _players_tennis(item)
+        if not p1 or not p2:
+            continue
+
+        nome1 = p1.get("name") or p1.get("full_name")
+        nome2 = p2.get("name") or p2.get("full_name")
+
+        if not nome1 or not nome2:
+            continue
+
+        evento_id = (
+            item.get("match_id")
+            or item.get("id")
+            or item.get("event_id")
+        )
+
+        if evento_id is None:
+            continue
+
+        jogos.append({
+            "evento_id": str(evento_id),
+            "jogo": f"{nome1} vs {nome2}",
+            "casa": nome1,
+            "fora": nome2,
+            "liga": _nome_torneio_tennis(item),
+            "data": dt.strftime("%d/%m/%Y %H:%M"),
+            "data_obj": dt,
+            "fonte_api": "api_tennis",
+            "modalidade": "Ténis",
+            "circuito": circuito,
+            "rank_casa": _rank_tennis(p1),
+            "rank_fora": _rank_tennis(p2),
+        })
+
+    jogos.sort(key=lambda x: x["data_obj"])
+
+    for jogo in jogos:
+        jogo.pop("data_obj", None)
+
+    return jogos[:50], None
+
+
+def dificuldade_tenis(jogo, valor):
+    rank1 = jogo.get("rank_casa")
+    rank2 = jogo.get("rank_fora")
+
+    if rank1 is None or rank2 is None:
+        return "Média", 1.5
+
+    escolhido = rank1 if valor == "Jogador1" else rank2
+    adversario = rank2 if valor == "Jogador1" else rank1
+
+    # Ranking menor = jogador mais bem classificado.
+    if escolhido <= max(10, adversario * 0.50):
+        return "Fácil", 1.0
+
+    if escolhido <= adversario * 1.15:
+        return "Média", 1.5
+
+    if escolhido <= adversario * 2.0:
+        return "Difícil", 2.0
+
+    return "Muito difícil", 3.0
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def buscar_resultado_tenis(evento_id):
+    if not TENNIS_API_KEY or not evento_id:
+        return None
+
+    url = f"{TENNIS_API_BASE}/matches/{evento_id}"
+
+    try:
+        r = requests.get(
+            url,
+            headers=headers_tennis(),
+            timeout=20,
+        )
+    except requests.RequestException:
+        return None
+
+    if r.status_code != 200:
+        return None
+
+    try:
+        dados = r.json()
+    except Exception:
+        return None
+
+    lista = _lista_tennis(dados)
+    if not lista:
+        return None
+
+    item = lista[0]
+    status = _status_tennis(item)
+
+    terminado = status in {
+        "finished",
+        "final",
+        "completed",
+        "complete",
+        "retired",
+        "walkover",
+    }
+
+    if not terminado:
+        return {
+            "status": "PENDING",
+        }
+
+    p1, p2 = _players_tennis(item)
+    if not p1 or not p2:
+        return None
+
+    nome1 = p1.get("name") or p1.get("full_name")
+    nome2 = p2.get("name") or p2.get("full_name")
+
+    vencedor = item.get("winner")
+    vencedor_nome = None
+
+    if isinstance(vencedor, dict):
+        vencedor_nome = (
+            vencedor.get("name")
+            or vencedor.get("full_name")
+        )
+    elif vencedor:
+        vencedor_nome = str(vencedor)
+
+    vencedor_indice = None
+
+    if vencedor_nome:
+        if vencedor_nome == nome1:
+            vencedor_indice = 0
+        elif vencedor_nome == nome2:
+            vencedor_indice = 1
+
+    # Fallback: alguns feeds marcam o vencedor dentro do jogador.
+    if vencedor_indice is None:
+        if isinstance(p1, dict) and p1.get("winner") is True:
+            vencedor_indice = 0
+        elif isinstance(p2, dict) and p2.get("winner") is True:
+            vencedor_indice = 1
+
+    # Fallback pelo número de sets.
+    score = item.get("score") or {}
+    sets = score.get("sets") if isinstance(score, dict) else None
+
+    if vencedor_indice is None and isinstance(sets, list):
+        s1 = 0
+        s2 = 0
+        for parcial in sets:
+            if (
+                isinstance(parcial, (list, tuple))
+                and len(parcial) >= 2
+            ):
+                try:
+                    a = int(parcial[0])
+                    b = int(parcial[1])
+                except Exception:
+                    continue
+
+                if a > b:
+                    s1 += 1
+                elif b > a:
+                    s2 += 1
+
+        if s1 > s2:
+            vencedor_indice = 0
+        elif s2 > s1:
+            vencedor_indice = 1
+
+    if vencedor_indice is None:
+        return None
+
+    placar = ""
+    if isinstance(sets, list):
+        partes = []
+        for parcial in sets:
+            if (
+                isinstance(parcial, (list, tuple))
+                and len(parcial) >= 2
+            ):
+                partes.append(
+                    f"{parcial[0]}-{parcial[1]}"
+                )
+        placar = ", ".join(partes)
+
+    return {
+        "status": "FINISHED",
+        "winner_index": vencedor_indice,
+        "winner_name": (
+            nome1 if vencedor_indice == 0 else nome2
+        ),
+        "placar": placar,
+    }
+
+
+
 # =========================================================
 # RESULTADOS AUTOMÁTICOS
 # =========================================================
@@ -1735,13 +2214,18 @@ def atualizar_resultados_automaticamente():
 
     pendentes_football_data = []
     pendentes_brasileirao = []
+    pendentes_tenis = []
 
     for p in pendentes:
         fonte = p.get("fonte_api")
+        modalidade = modalidade_previsao(p)
 
-        # O nome da liga também serve como fallback para
-        # previsões antigas guardadas antes desta mudança.
-        if (
+        if modalidade == "Ténis" or fonte == "api_tennis":
+            # Só consultar a API depois da hora prevista do encontro,
+            # para poupar o limite mensal.
+            if jogo_comecou(p):
+                pendentes_tenis.append(p)
+        elif (
             fonte == "rapidapi_brasileirao"
             or p.get("liga") == "Brasileirão Série A"
         ):
@@ -1771,7 +2255,8 @@ def atualizar_resultados_automaticamente():
 
     atualizados = 0
 
-    for previsao in pendentes:
+    # Futebol
+    for previsao in pendentes_football_data + pendentes_brasileirao:
         fonte = previsao.get("fonte_api")
 
         if (
@@ -1801,6 +2286,38 @@ def atualizar_resultados_automaticamente():
             continue
 
         placar, resultado_real, acertou = avaliacao
+
+        r = atualizar_previsao_admin(
+            previsao["id"],
+            placar,
+            resultado_real,
+            "Acertou" if acertou else "Errou",
+        )
+
+        if (
+            r is not None
+            and r.status_code in [200, 204]
+        ):
+            atualizados += 1
+
+    # Ténis
+    for previsao in pendentes_tenis:
+        resultado = buscar_resultado_tenis(
+            previsao.get("evento_id")
+        )
+
+        if not resultado:
+            continue
+
+        if resultado.get("status") != "FINISHED":
+            continue
+
+        valor = previsao.get("valor_previsao")
+        escolhido = 0 if valor == "Jogador1" else 1
+        acertou = escolhido == resultado.get("winner_index")
+
+        placar = resultado.get("placar") or ""
+        resultado_real = resultado.get("winner_name") or ""
 
         r = atualizar_previsao_admin(
             previsao["id"],
@@ -1977,6 +2494,12 @@ def verificar_contradicao(
 # =========================================================
 
 def opcoes_para_tipo(tipo, jogo):
+    if tipo == "tenis_vencedor":
+        return {
+            jogo.get("casa", "Jogador 1"): "Jogador1",
+            jogo.get("fora", "Jogador 2"): "Jogador2",
+        }
+
     if tipo == "resultado":
         return {
             f"{jogo['casa']} vence": "Casa",
@@ -2028,6 +2551,11 @@ def opcoes_para_tipo(tipo, jogo):
 
 
 def texto_previsao(tipo, valor, jogo):
+    if tipo == "tenis_vencedor":
+        if valor == "Jogador1":
+            return f"{jogo.get('casa')} vence"
+        return f"{jogo.get('fora')} vence"
+
     if tipo == "resultado":
         if valor == "Casa":
             return f"{jogo['casa']} vence"
@@ -2304,7 +2832,7 @@ def mostrar_estatisticas_completas(lista, prefixo=""):
 # INTERFACE — LOGIN
 # =========================================================
 
-st.title("⚽ Previsões de Futebol")
+st.title("🏆 Previsões Desportivas")
 st.caption("Jogo de previsões entre amigos.")
 
 # Recupera e renova automaticamente a sessão guardada no navegador.
@@ -2498,127 +3026,69 @@ with tab_prever:
 
     st.subheader("Nova previsão")
 
-    liga = st.selectbox(
-        "Competição",
-        list(LIGAS.keys()),
-        key="liga_prever",
+    modalidade = st.selectbox(
+        "Modalidade",
+        ["⚽ Futebol", "🎾 Ténis"],
+        key="modalidade_prever",
     )
 
-    # Os jogos são carregados automaticamente quando a competição muda.
-    with st.spinner("A carregar jogos..."):
-        jogos, erro = buscar_jogos(liga)
-        classificacao_atual = buscar_classificacao(liga)
-        perfil_golos_atual = buscar_perfil_golos_liga(liga)
-
-    st.session_state["classificacao"] = classificacao_atual
-    st.session_state["perfil_golos"] = perfil_golos_atual
-
-    if erro:
-        st.error(erro)
-        jogos = []
-
-    if not jogos and not erro:
-        st.info(
-            "Não encontrei jogos futuros desta competição "
-            "nos próximos 45 dias."
+    if modalidade == "🎾 Ténis":
+        circuito = st.selectbox(
+            "Circuito",
+            ["ATP", "WTA"],
+            key="circuito_tenis",
         )
 
-    if jogos:
-        indice_jogo = st.selectbox(
-            "Escolhe o jogo",
-            options=range(len(jogos)),
-            format_func=lambda i: (
-                f"{jogos[i]['data']} — "
-                f"{jogos[i]['jogo']}"
-            ),
-            key="indice_jogo_novo",
-        )
+        with st.spinner("A carregar encontros de ténis..."):
+            jogos_tenis, erro_tenis = buscar_jogos_tenis(circuito)
 
-        jogo = jogos[indice_jogo]
-        bloqueado = jogo_comecou(jogo)
+        if erro_tenis:
+            st.error(erro_tenis)
+            jogos_tenis = []
 
-        fonte_jogo = jogo.get(
-            "fonte_api",
-            fonte_api_liga(jogo["liga"]),
-        )
+        if not jogos_tenis and not erro_tenis:
+            st.info(
+                "Não encontrei encontros futuros de "
+                f"{circuito} nos próximos 14 dias."
+            )
 
-        existentes = [
-            p for p in minhas
-            if (
-                str(p.get("match_id"))
-                == str(jogo["match_id"])
-                and (
-                    p.get("fonte_api")
-                    or (
-                        "rapidapi_brasileirao"
-                        if p.get("liga") == "Brasileirão Série A"
-                        else "football_data"
-                    )
+        if jogos_tenis:
+            indice_tenis = st.selectbox(
+                "Escolhe o encontro",
+                options=range(len(jogos_tenis)),
+                format_func=lambda i: (
+                    f"{jogos_tenis[i]['data']} — "
+                    f"{jogos_tenis[i]['jogo']} "
+                    f"({jogos_tenis[i]['liga']})"
+                ),
+                key="indice_tenis_novo",
+            )
+
+            jogo = jogos_tenis[indice_tenis]
+
+            existentes = [
+                p for p in minhas
+                if (
+                    modalidade_previsao(p) == "Ténis"
+                    and str(p.get("evento_id"))
+                    == str(jogo["evento_id"])
                 )
-                == fonte_jogo
-            )
-        ]
+            ]
 
-        tipos_ja_feitos = {
-            p.get("tipo_previsao")
-            for p in existentes
-        }
-
-        st.caption(
-            f"{len(existentes)} previsões já feitas "
-            f"neste jogo."
-        )
-
-        if tipos_ja_feitos:
-            st.write(
-                "**Já preenchidos:** "
-                + ", ".join(
-                    categoria_estatistica(t)
-                    for t in tipos_ja_feitos
-                    if t
-                )
+            ja_tem = any(
+                p.get("tipo_previsao") == "tenis_vencedor"
+                for p in existentes
             )
 
-        if bloqueado:
-            st.error(
-                "🔒 O jogo já começou. "
-                "As previsões estão fechadas."
-            )
-        else:
-            tipos_ui = {
-                "Resultado do jogo": "resultado",
-                "Dupla possibilidade": "dupla_possibilidade",
-                "Golos — tempo regulamentar":
-                    "golos_tempo_regulamentar",
-                "Golos — intervalo":
-                    "golos_intervalo",
-                f"Golos do {jogo['casa']}":
-                    "golos_equipa_casa",
-                f"Golos do {jogo['fora']}":
-                    "golos_equipa_fora",
-                "Ambas as equipas marcam":
-                    "ambas_marcam",
-            }
-
-            label_tipo = st.selectbox(
-                "Tipo de previsão",
-                list(tipos_ui.keys()),
-                key=f"tipo_{jogo['match_id']}",
-            )
-
-            tipo = tipos_ui[label_tipo]
             opcoes = opcoes_para_tipo(
-                tipo,
+                "tenis_vencedor",
                 jogo,
             )
 
             label_valor = st.selectbox(
-                "Escolha",
+                "Quem vence?",
                 list(opcoes.keys()),
-                key=(
-                    f"valor_{jogo['match_id']}_"
-                    f"{tipo}"
-                ),
+                key=f"tenis_valor_{jogo['evento_id']}",
             )
 
             valor = opcoes[label_valor]
@@ -2627,136 +3097,380 @@ with tab_prever:
                 "Confiança",
                 options=[1, 2, 3, 4, 5],
                 value=3,
-                key=(
-                    f"confianca_{jogo['match_id']}"
-                ),
+                key=f"tenis_conf_{jogo['evento_id']}",
+            )
+
+            dificuldade, multiplicador = (
+                dificuldade_tenis(jogo, valor)
             )
 
             texto = texto_previsao(
-                tipo,
+                "tenis_vencedor",
                 valor,
                 jogo,
             )
 
-            posicoes = st.session_state.get("classificacao", {})
-            perfis_golos = st.session_state.get("perfil_golos", {})
+            rank1 = jogo.get("rank_casa")
+            rank2 = jogo.get("rank_fora")
 
-            dificuldade, multiplicador = dificuldade_previsao(
-                tipo,
-                valor,
-                jogo,
-                posicoes,
-                perfis_golos,
-            )
+            detalhe_rank = ""
+            if rank1 and rank2:
+                detalhe_rank = (
+                    f"\n\nRanking: {jogo['casa']} #{rank1} • "
+                    f"{jogo['fora']} #{rank2}"
+                )
 
             st.info(
                 f"🎯 {texto}\n\n"
                 f"Dificuldade: **{dificuldade} ×{multiplicador:g}** • "
                 f"Se acertar: **{formatar_pontos(confianca * multiplicador)} pontos** • "
                 f"Se errar: **-{confianca} pontos**"
+                f"{detalhe_rank}"
             )
 
             if st.button(
-                "Guardar previsão",
+                "Guardar previsão de ténis",
                 type="primary",
-                key=(
-                    f"guardar_{jogo['match_id']}"
-                ),
+                key=f"guardar_tenis_{jogo['evento_id']}",
             ):
                 if jogo_comecou(jogo):
                     st.error(
-                        "O jogo já começou."
+                        "O encontro já começou."
                     )
-                elif tipo in tipos_ja_feitos:
+                elif ja_tem:
                     st.warning(
-                        "Já tens uma previsão "
-                        "deste tipo neste jogo."
+                        "Já tens uma previsão para "
+                        "este encontro."
                     )
                 else:
-                    contradicao, mensagem = (
-                        verificar_contradicao(
-                            existentes,
-                            tipo,
-                            valor,
-                        )
+                    equipa_previsao = (
+                        jogo["casa"]
+                        if valor == "Jogador1"
+                        else jogo["fora"]
                     )
 
-                    if contradicao:
+                    registo = {
+                        "user_id":
+                            st.session_state["user_id"],
+                        "utilizador":
+                            st.session_state["nome"],
+                        "modalidade":
+                            "Ténis",
+                        "evento_id":
+                            jogo["evento_id"],
+                        "match_id":
+                            None,
+                        "fonte_api":
+                            "api_tennis",
+                        "jogo":
+                            jogo["jogo"],
+                        "casa":
+                            jogo["casa"],
+                        "fora":
+                            jogo["fora"],
+                        "liga":
+                            jogo["liga"],
+                        "data":
+                            jogo["data"],
+                        "previsao":
+                            texto,
+                        "tipo_previsao":
+                            "tenis_vencedor",
+                        "valor_previsao":
+                            valor,
+                        "equipa_previsao":
+                            equipa_previsao,
+                        "confianca":
+                            confianca,
+                        "dificuldade":
+                            dificuldade,
+                        "multiplicador":
+                            multiplicador,
+                        "placar":
+                            "",
+                        "resultado":
+                            "Pendente",
+                        "resultado_real":
+                            None,
+                    }
+
+                    r = guardar_previsao(registo)
+
+                    if (
+                        r is not None
+                        and r.status_code in [200, 201]
+                    ):
+                        st.success(
+                            "✅ Previsão de ténis guardada!"
+                        )
+                        st.rerun()
+                    else:
+                        st.error(
+                            "Não foi possível guardar."
+                        )
+                        if r is not None:
+                            st.code(r.text)
+
+    else:
+        liga = st.selectbox(
+            "Competição",
+            list(LIGAS.keys()),
+            key="liga_prever",
+        )
+
+        # Os jogos são carregados automaticamente quando a competição muda.
+        with st.spinner("A carregar jogos..."):
+            jogos, erro = buscar_jogos(liga)
+            classificacao_atual = buscar_classificacao(liga)
+            perfil_golos_atual = buscar_perfil_golos_liga(liga)
+
+        st.session_state["classificacao"] = classificacao_atual
+        st.session_state["perfil_golos"] = perfil_golos_atual
+
+        if erro:
+            st.error(erro)
+            jogos = []
+
+        if not jogos and not erro:
+            st.info(
+                "Não encontrei jogos futuros desta competição "
+                "nos próximos 45 dias."
+            )
+
+        if jogos:
+            indice_jogo = st.selectbox(
+                "Escolhe o jogo",
+                options=range(len(jogos)),
+                format_func=lambda i: (
+                    f"{jogos[i]['data']} — "
+                    f"{jogos[i]['jogo']}"
+                ),
+                key="indice_jogo_novo",
+            )
+
+            jogo = jogos[indice_jogo]
+            bloqueado = jogo_comecou(jogo)
+
+            fonte_jogo = jogo.get(
+                "fonte_api",
+                fonte_api_liga(jogo["liga"]),
+            )
+
+            existentes = [
+                p for p in minhas
+                if (
+                    str(p.get("match_id"))
+                    == str(jogo["match_id"])
+                    and (
+                        p.get("fonte_api")
+                        or (
+                            "rapidapi_brasileirao"
+                            if p.get("liga") == "Brasileirão Série A"
+                            else "football_data"
+                        )
+                    )
+                    == fonte_jogo
+                )
+            ]
+
+            tipos_ja_feitos = {
+                p.get("tipo_previsao")
+                for p in existentes
+            }
+
+            st.caption(
+                f"{len(existentes)} previsões já feitas "
+                f"neste jogo."
+            )
+
+            if tipos_ja_feitos:
+                st.write(
+                    "**Já preenchidos:** "
+                    + ", ".join(
+                        categoria_estatistica(t)
+                        for t in tipos_ja_feitos
+                        if t
+                    )
+                )
+
+            if bloqueado:
+                st.error(
+                    "🔒 O jogo já começou. "
+                    "As previsões estão fechadas."
+                )
+            else:
+                tipos_ui = {
+                    "Resultado do jogo": "resultado",
+                    "Dupla possibilidade": "dupla_possibilidade",
+                    "Golos — tempo regulamentar":
+                        "golos_tempo_regulamentar",
+                    "Golos — intervalo":
+                        "golos_intervalo",
+                    f"Golos do {jogo['casa']}":
+                        "golos_equipa_casa",
+                    f"Golos do {jogo['fora']}":
+                        "golos_equipa_fora",
+                    "Ambas as equipas marcam":
+                        "ambas_marcam",
+                }
+
+                label_tipo = st.selectbox(
+                    "Tipo de previsão",
+                    list(tipos_ui.keys()),
+                    key=f"tipo_{jogo['match_id']}",
+                )
+
+                tipo = tipos_ui[label_tipo]
+                opcoes = opcoes_para_tipo(
+                    tipo,
+                    jogo,
+                )
+
+                label_valor = st.selectbox(
+                    "Escolha",
+                    list(opcoes.keys()),
+                    key=(
+                        f"valor_{jogo['match_id']}_"
+                        f"{tipo}"
+                    ),
+                )
+
+                valor = opcoes[label_valor]
+
+                confianca = st.select_slider(
+                    "Confiança",
+                    options=[1, 2, 3, 4, 5],
+                    value=3,
+                    key=(
+                        f"confianca_{jogo['match_id']}"
+                    ),
+                )
+
+                texto = texto_previsao(
+                    tipo,
+                    valor,
+                    jogo,
+                )
+
+                posicoes = st.session_state.get("classificacao", {})
+                perfis_golos = st.session_state.get("perfil_golos", {})
+
+                dificuldade, multiplicador = dificuldade_previsao(
+                    tipo,
+                    valor,
+                    jogo,
+                    posicoes,
+                    perfis_golos,
+                )
+
+                st.info(
+                    f"🎯 {texto}\n\n"
+                    f"Dificuldade: **{dificuldade} ×{multiplicador:g}** • "
+                    f"Se acertar: **{formatar_pontos(confianca * multiplicador)} pontos** • "
+                    f"Se errar: **-{confianca} pontos**"
+                )
+
+                if st.button(
+                    "Guardar previsão",
+                    type="primary",
+                    key=(
+                        f"guardar_{jogo['match_id']}"
+                    ),
+                ):
+                    if jogo_comecou(jogo):
+                        st.error(
+                            "O jogo já começou."
+                        )
+                    elif tipo in tipos_ja_feitos:
                         st.warning(
-                            f"⚠️ {mensagem}"
+                            "Já tens uma previsão "
+                            "deste tipo neste jogo."
                         )
                     else:
-                        equipa_previsao = None
-                        if tipo == "golos_equipa_casa":
-                            equipa_previsao = jogo["casa"]
-                        elif tipo == "golos_equipa_fora":
-                            equipa_previsao = jogo["fora"]
-
-                        registo = {
-                            "user_id":
-                                st.session_state[
-                                    "user_id"
-                                ],
-                            "utilizador":
-                                st.session_state["nome"],
-                            "match_id":
-                                jogo["match_id"],
-                            "fonte_api":
-                                jogo.get(
-                                    "fonte_api",
-                                    fonte_api_liga(jogo["liga"]),
-                                ),
-                            "jogo":
-                                jogo["jogo"],
-                            "casa":
-                                jogo["casa"],
-                            "fora":
-                                jogo["fora"],
-                            "liga":
-                                jogo["liga"],
-                            "data":
-                                jogo["data"],
-                            "previsao":
-                                texto,
-                            "tipo_previsao":
+                        contradicao, mensagem = (
+                            verificar_contradicao(
+                                existentes,
                                 tipo,
-                            "valor_previsao":
                                 valor,
-                            "equipa_previsao":
-                                equipa_previsao,
-                            "confianca":
-                                confianca,
-                            "dificuldade":
-                                dificuldade,
-                            "multiplicador":
-                                multiplicador,
-                            "placar":
-                                "",
-                            "resultado":
-                                "Pendente",
-                            "resultado_real":
-                                None,
-                        }
-
-                        r = guardar_previsao(
-                            registo
+                            )
                         )
 
-                        if (
-                            r is not None
-                            and r.status_code
-                            in [200, 201]
-                        ):
-                            st.success(
-                                "✅ Previsão guardada!"
+                        if contradicao:
+                            st.warning(
+                                f"⚠️ {mensagem}"
                             )
-                            st.rerun()
                         else:
-                            st.error(
-                                "Não foi possível guardar."
+                            equipa_previsao = None
+                            if tipo == "golos_equipa_casa":
+                                equipa_previsao = jogo["casa"]
+                            elif tipo == "golos_equipa_fora":
+                                equipa_previsao = jogo["fora"]
+
+                            registo = {
+                                "user_id":
+                                    st.session_state[
+                                        "user_id"
+                                    ],
+                                "utilizador":
+                                    st.session_state["nome"],
+                                "match_id":
+                                    jogo["match_id"],
+                                "fonte_api":
+                                    jogo.get(
+                                        "fonte_api",
+                                        fonte_api_liga(jogo["liga"]),
+                                    ),
+                                "jogo":
+                                    jogo["jogo"],
+                                "casa":
+                                    jogo["casa"],
+                                "fora":
+                                    jogo["fora"],
+                                "liga":
+                                    jogo["liga"],
+                                "data":
+                                    jogo["data"],
+                                "previsao":
+                                    texto,
+                                "tipo_previsao":
+                                    tipo,
+                                "valor_previsao":
+                                    valor,
+                                "equipa_previsao":
+                                    equipa_previsao,
+                                "confianca":
+                                    confianca,
+                                "dificuldade":
+                                    dificuldade,
+                                "multiplicador":
+                                    multiplicador,
+                                "placar":
+                                    "",
+                                "resultado":
+                                    "Pendente",
+                                "resultado_real":
+                                    None,
+                            }
+
+                            r = guardar_previsao(
+                                registo
                             )
-                            if r is not None:
-                                st.code(r.text)
+
+                            if (
+                                r is not None
+                                and r.status_code
+                                in [200, 201]
+                            ):
+                                st.success(
+                                    "✅ Previsão guardada!"
+                                )
+                                st.rerun()
+                            else:
+                                st.error(
+                                    "Não foi possível guardar."
+                                )
+                                if r is not None:
+                                    st.code(r.text)
 
 
 # =========================================================
@@ -2781,7 +3495,14 @@ with tab_minhas:
         if p.get("tipo_previsao")
     })
 
-    c1, c2, c3, c4 = st.columns(4)
+    c0, c1, c2, c3, c4 = st.columns(5)
+
+    with c0:
+        filtro_modalidade = st.selectbox(
+            "Modalidade",
+            ["Todas", "Futebol", "Ténis"],
+            key="filtro_modalidade_minhas",
+        )
 
     with c1:
         filtro_liga = st.selectbox(
@@ -2821,6 +3542,12 @@ with tab_minhas:
     agora = datetime.now(TZ)
 
     for p in minhas:
+        if (
+            filtro_modalidade != "Todas"
+            and modalidade_previsao(p) != filtro_modalidade
+        ):
+            continue
+
         if (
             filtro_liga != "Todas"
             and p.get("liga") != filtro_liga
@@ -2872,16 +3599,7 @@ with tab_minhas:
         grupos = defaultdict(list)
 
         for p in filtradas:
-            chave_jogo = (
-                p.get("fonte_api")
-                or (
-                    "rapidapi_brasileirao"
-                    if p.get("liga") == "Brasileirão Série A"
-                    else "football_data"
-                ),
-                p.get("match_id"),
-            )
-            grupos[chave_jogo].append(p)
+            grupos[chave_evento(p)].append(p)
 
         for chave_jogo, lista in grupos.items():
             primeira = lista[0]
@@ -3205,16 +3923,7 @@ with tab_historico:
 
             grupos_hist = defaultdict(list)
             for p in historico_recente:
-                chave_hist = (
-                    p.get("fonte_api")
-                    or (
-                        "rapidapi_brasileirao"
-                        if p.get("liga") == "Brasileirão Série A"
-                        else "football_data"
-                    ),
-                    p.get("match_id"),
-                )
-                grupos_hist[chave_hist].append(p)
+                grupos_hist[chave_evento(p)].append(p)
 
             for _, lista in grupos_hist.items():
                 primeira = lista[0]
@@ -3253,6 +3962,13 @@ with tab_historico:
 # =========================================================
 
 with tab_ranking:
+    modalidade_ranking = st.radio(
+        "Modalidade",
+        ["Geral", "Futebol", "Ténis"],
+        horizontal=True,
+        key="modalidade_ranking",
+    )
+
     periodo_ranking = st.radio(
         "Período",
         ["Total", "Esta semana", "Este mês"],
@@ -3260,7 +3976,16 @@ with tab_ranking:
         key="periodo_ranking",
     )
 
-    previsoes_ranking = filtrar_periodo(previsoes, periodo_ranking)
+    previsoes_ranking = filtrar_periodo(
+        previsoes,
+        periodo_ranking,
+    )
+
+    if modalidade_ranking != "Geral":
+        previsoes_ranking = [
+            p for p in previsoes_ranking
+            if modalidade_previsao(p) == modalidade_ranking
+        ]
 
     grupos_amigos = defaultdict(list)
     for p in previsoes_ranking:
@@ -3349,6 +4074,11 @@ with tab_ranking:
 
     st.subheader("🌟 Melhor previsão da semana")
     semana = filtrar_periodo(previsoes, "Esta semana")
+    if modalidade_ranking != "Geral":
+        semana = [
+            p for p in semana
+            if modalidade_previsao(p) == modalidade_ranking
+        ]
     acertos_semana = [p for p in semana if p.get("resultado") == "Acertou"]
     if acertos_semana:
         melhor_prev = max(
