@@ -426,6 +426,9 @@ def fazer_refresh(refresh_token):
 
 
 def aplicar_sessao(dados, nome_fallback=None):
+    # Um login real volta a permitir a restauração automática.
+    st.session_state["manual_logout"] = False
+
     user = dados.get("user") or {}
     metadata = user.get("user_metadata", {}) or {}
 
@@ -448,6 +451,12 @@ def tentar_restaurar_sessao():
     if "access_token" in st.session_state:
         return True
 
+    # Se o utilizador carregou em "Sair", não restaurar a sessão
+    # automaticamente mesmo que o navegador ainda entregue o cookie antigo
+    # durante o rerun imediato.
+    if st.session_state.get("manual_logout"):
+        return False
+
     refresh_token = cookies.get("refresh_token")
     if not refresh_token:
         return False
@@ -466,6 +475,9 @@ def tentar_restaurar_sessao():
 
 
 def garantir_sessao_valida():
+    if st.session_state.get("manual_logout"):
+        return False
+
     if "access_token" not in st.session_state:
         return tentar_restaurar_sessao()
 
@@ -492,11 +504,28 @@ def garantir_sessao_valida():
 
 
 def terminar_sessao():
+    # Bloqueia a restauração automática no rerun imediato.
+    st.session_state["manual_logout"] = True
+
+    # Apaga o refresh token persistente.
     if "refresh_token" in cookies:
         del cookies["refresh_token"]
-        cookies.save()
 
-    for chave in list(st.session_state.keys()):
+    # Também gravamos um valor vazio para evitar que alguns navegadores
+    # reutilizem o valor anterior enquanto o cookie é sincronizado.
+    cookies["refresh_token"] = ""
+    cookies.save()
+
+    # Remove apenas os dados ligados à autenticação e sessão do utilizador.
+    chaves_auth = [
+        "access_token",
+        "expires_at",
+        "user_id",
+        "nome",
+        "resultados_verificados",
+    ]
+
+    for chave in chaves_auth:
         st.session_state.pop(chave, None)
 
     st.rerun()
