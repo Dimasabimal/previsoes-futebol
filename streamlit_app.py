@@ -1580,15 +1580,42 @@ def _lista_tennis(dados):
         return dados
 
     if isinstance(dados, dict):
-        for chave in ["matches", "data", "results", "response"]:
+        for chave in [
+            "matches",
+            "data",
+            "results",
+            "response",
+            "items",
+            "events",
+        ]:
             valor = dados.get(chave)
+
             if isinstance(valor, list):
                 return valor
+
+            # Alguns serviços embrulham a lista dentro de data/results.
+            if isinstance(valor, dict):
+                for subchave in [
+                    "matches",
+                    "items",
+                    "results",
+                    "events",
+                    "data",
+                ]:
+                    subvalor = valor.get(subchave)
+                    if isinstance(subvalor, list):
+                        return subvalor
 
         # Alguns endpoints devolvem um único encontro.
         if any(
             chave in dados
-            for chave in ["match_id", "id", "players", "player1"]
+            for chave in [
+                "match_id",
+                "id",
+                "players",
+                "player1",
+                "event_id",
+            ]
         ):
             return [dados]
 
@@ -1674,20 +1701,47 @@ def _parse_data_tennis(item):
         item.get("scheduled"),
         item.get("start_at"),
         item.get("datetime"),
+        item.get("start"),
+        item.get("start_date"),
+        item.get("event_date"),
         item.get("date"),
+        item.get("timestamp"),
+        item.get("start_timestamp"),
     ]
 
     for valor in candidatos:
-        if not valor:
+        if valor is None or valor == "":
             continue
+
+        # Unix timestamp em segundos ou milissegundos.
+        if isinstance(valor, (int, float)):
+            try:
+                numero = float(valor)
+                if numero > 10_000_000_000:
+                    numero /= 1000
+                return datetime.fromtimestamp(
+                    numero,
+                    tz=ZoneInfo("UTC"),
+                ).astimezone(TZ)
+            except Exception:
+                pass
 
         # Data isolada + hora isolada.
         if (
             isinstance(valor, str)
             and len(valor) == 10
-            and item.get("time")
+            and (
+                item.get("time")
+                or item.get("event_time")
+                or item.get("start_time_local")
+            )
         ):
-            valor = f"{valor}T{item.get('time')}"
+            hora = (
+                item.get("time")
+                or item.get("event_time")
+                or item.get("start_time_local")
+            )
+            valor = f"{valor}T{hora}"
 
         try:
             dt = datetime.fromisoformat(
@@ -1702,6 +1756,8 @@ def _parse_data_tennis(item):
         for formato in [
             "%Y-%m-%d %H:%M:%S",
             "%Y-%m-%d %H:%M",
+            "%Y-%m-%dT%H:%M:%S",
+            "%Y-%m-%dT%H:%M",
             "%d/%m/%Y %H:%M",
         ]:
             try:
@@ -1721,6 +1777,10 @@ def _tour_tennis(item):
         item.get("category"),
         item.get("gender"),
         item.get("circuit"),
+        item.get("event_type"),
+        item.get("event_type_type"),
+        item.get("type"),
+        item.get("competition_type"),
     ]
 
     torneio = item.get("tournament")
@@ -1729,15 +1789,31 @@ def _tour_tennis(item):
             torneio.get("tour"),
             torneio.get("category"),
             torneio.get("gender"),
+            torneio.get("type"),
+            torneio.get("name"),
         ])
+    elif torneio:
+        valores.append(torneio)
 
     texto = " ".join(
         str(v) for v in valores if v
     ).lower()
 
-    if "wta" in texto or "women" in texto or "female" in texto:
+    if (
+        "wta" in texto
+        or "women" in texto
+        or "female" in texto
+        or "women singles" in texto
+    ):
         return "WTA"
-    if "atp" in texto or "men" in texto or "male" in texto:
+
+    if (
+        "atp" in texto
+        or "men" in texto
+        or "male" in texto
+        or "men singles" in texto
+        or "challenger" in texto
+    ):
         return "ATP"
 
     return None
@@ -1754,7 +1830,7 @@ def _status_tennis(item):
     return str(status or "").strip().lower()
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def buscar_jogos_tenis(circuito):
     if not TENNIS_API_KEY:
         return [], (
@@ -1764,25 +1840,67 @@ def buscar_jogos_tenis(circuito):
 
     url = f"{TENNIS_API_BASE}/matches"
 
-    try:
-        r = requests.get(
-            url,
-            headers=headers_tennis(),
-            timeout=20,
-        )
-    except requests.RequestException as erro:
-        return [], f"Erro de ligação à API Tennis: {erro}"
-
-    if r.status_code != 200:
-        return [], f"Erro API Tennis: {r.status_code}"
-
-    try:
-        dados = r.json()
-    except Exception:
-        return [], "A API Tennis devolveu uma resposta inválida."
-
     agora = datetime.now(TZ)
     limite = agora + timedelta(days=14)
+
+    # A API suporta procura de jogos por data. Primeiro tentamos
+    # uma janela; se a API não reconhecer esses nomes, fazemos
+    # um fallback para a data de hoje.
+    tentativas = [
+        {
+            "date_from": agora.date().isoformat(),
+            "date_to": limite.date().isoformat(),
+        },
+        {
+            "from": agora.date().isoformat(),
+            "to": limite.date().isoformat(),
+        },
+        {
+            "date": agora.date().isoformat(),
+        },
+        {},
+    ]
+
+    dados = None
+    ultimo_erro = None
+
+    for params in tentativas:
+        try:
+            r = requests.get(
+                url,
+                headers=headers_tennis(),
+                params=params,
+                timeout=20,
+            )
+        except requests.RequestException as erro:
+            ultimo_erro = f"Erro de ligação à API Tennis: {erro}"
+            continue
+
+        if r.status_code != 200:
+            ultimo_erro = f"Erro API Tennis: {r.status_code}"
+            continue
+
+        try:
+            candidato = r.json()
+        except Exception:
+            ultimo_erro = (
+                "A API Tennis devolveu uma resposta inválida."
+            )
+            continue
+
+        lista = _lista_tennis(candidato)
+
+        # Se veio uma lista com dados, já temos a melhor resposta.
+        if lista:
+            dados = candidato
+            break
+
+        # Guardar uma resposta válida vazia como último recurso.
+        if dados is None:
+            dados = candidato
+
+    if dados is None:
+        return [], ultimo_erro or "Não foi possível consultar a API Tennis."
 
     estados_finais = {
         "finished",
@@ -1793,6 +1911,8 @@ def buscar_jogos_tenis(circuito):
         "walkover",
         "cancelled",
         "canceled",
+        "ended",
+        "closed",
     }
 
     jogos = []
@@ -1806,8 +1926,12 @@ def buscar_jogos_tenis(circuito):
             continue
 
         dt = _parse_data_tennis(item)
-        if dt is None or dt <= agora or dt > limite:
-            continue
+
+        # Se a API não enviar hora mas enviar um jogo agendado,
+        # não o descartamos automaticamente.
+        if dt is not None:
+            if dt <= agora or dt > limite:
+                continue
 
         tour = _tour_tennis(item)
         if tour and tour != circuito:
@@ -1817,8 +1941,16 @@ def buscar_jogos_tenis(circuito):
         if not p1 or not p2:
             continue
 
-        nome1 = p1.get("name") or p1.get("full_name")
-        nome2 = p2.get("name") or p2.get("full_name")
+        nome1 = (
+            p1.get("name")
+            or p1.get("full_name")
+            or p1.get("player_name")
+        )
+        nome2 = (
+            p2.get("name")
+            or p2.get("full_name")
+            or p2.get("player_name")
+        )
 
         if not nome1 or not nome2:
             continue
@@ -1827,10 +1959,20 @@ def buscar_jogos_tenis(circuito):
             item.get("match_id")
             or item.get("id")
             or item.get("event_id")
+            or item.get("key")
         )
 
         if evento_id is None:
             continue
+
+        if dt is not None:
+            data_texto = dt.strftime("%d/%m/%Y %H:%M")
+            data_obj = dt
+        else:
+            data_texto = (
+                str(item.get("date") or item.get("event_date") or "Data a confirmar")
+            )
+            data_obj = limite
 
         jogos.append({
             "evento_id": str(evento_id),
@@ -1838,8 +1980,8 @@ def buscar_jogos_tenis(circuito):
             "casa": nome1,
             "fora": nome2,
             "liga": _nome_torneio_tennis(item),
-            "data": dt.strftime("%d/%m/%Y %H:%M"),
-            "data_obj": dt,
+            "data": data_texto,
+            "data_obj": data_obj,
             "fonte_api": "api_tennis",
             "modalidade": "Ténis",
             "circuito": circuito,
