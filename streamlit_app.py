@@ -2024,6 +2024,89 @@ def buscar_jogos_tenis(circuito):
     return jogos[:50], None
 
 
+
+@st.cache_data(ttl=60, show_spinner=False)
+def diagnostico_upcoming_tennis(circuito):
+    """
+    Diagnóstico seguro do endpoint /matches/upcoming.
+    Não mostra a chave de API.
+    """
+    if not TENNIS_API_KEY:
+        return {"erro": "TENNIS_API_KEY não configurada."}
+
+    agora = datetime.now(TZ)
+    limite = agora + timedelta(days=2)
+
+    circuito_api = "atp" if circuito == "ATP" else "wta"
+
+    url = f"{TENNIS_API_BASE}/matches/upcoming"
+    params = {
+        "from": agora.date().isoformat(),
+        "to": limite.date().isoformat(),
+        "circuit": circuito_api,
+        "doubles": "false",
+        "limit": 100,
+    }
+
+    try:
+        r = requests.get(
+            url,
+            headers=headers_tennis(),
+            params=params,
+            timeout=20,
+        )
+    except requests.RequestException as erro:
+        return {"erro": f"Erro de ligação: {erro}"}
+
+    info = {
+        "status_http": r.status_code,
+        "endpoint": "/v1/matches/upcoming",
+        "circuito_pedido": circuito_api,
+        "from": params["from"],
+        "to": params["to"],
+    }
+
+    try:
+        dados = r.json()
+    except Exception:
+        info["resposta_texto"] = r.text[:1500]
+        return info
+
+    if isinstance(dados, dict):
+        info["campos_topo"] = list(dados.keys())
+        info["meta"] = dados.get("meta")
+
+        lista = _lista_tennis(dados)
+        info["quantidade_itens"] = len(lista)
+
+        exemplos = []
+        for item in lista[:5]:
+            if not isinstance(item, dict):
+                exemplos.append(str(item))
+                continue
+
+            lados = item.get("sides")
+            exemplos.append({
+                "id": item.get("id"),
+                "date": item.get("date"),
+                "status": item.get("status"),
+                "circuit": item.get("circuit"),
+                "doubles": item.get("doubles"),
+                "campos_item": list(item.keys()),
+                "sides": lados,
+                "players": item.get("players"),
+                "player1": item.get("player1"),
+                "player2": item.get("player2"),
+            })
+
+        info["exemplos"] = exemplos
+    else:
+        info["tipo_resposta"] = type(dados).__name__
+        info["resposta"] = dados
+
+    return info
+
+
 def dificuldade_tenis(jogo, valor):
     rank1 = jogo.get("rank_casa")
     rank2 = jogo.get("rank_fora")
@@ -3214,6 +3297,13 @@ with tab_prever:
                 "Não encontrei encontros futuros de "
                 f"{circuito} nos próximos 2 dias."
             )
+
+            with st.expander("🔧 Diagnóstico do endpoint upcoming"):
+                st.caption(
+                    "Não mostra a tua chave. "
+                    "Mostra apenas a resposta do endpoint."
+                )
+                st.json(diagnostico_upcoming_tennis(circuito))
 
 
 
