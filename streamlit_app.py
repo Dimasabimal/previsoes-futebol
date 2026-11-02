@@ -1997,6 +1997,73 @@ def buscar_jogos_tenis(circuito):
     return jogos[:50], None
 
 
+
+@st.cache_data(ttl=60, show_spinner=False)
+def diagnostico_tennis_api():
+    """
+    Diagnóstico seguro da API Tennis.
+    Não inclui a chave de API nem headers.
+    """
+    if not TENNIS_API_KEY:
+        return {
+            "erro": "TENNIS_API_KEY não configurada."
+        }
+
+    url = f"{TENNIS_API_BASE}/matches"
+
+    try:
+        r = requests.get(
+            url,
+            headers=headers_tennis(),
+            timeout=20,
+        )
+    except requests.RequestException as erro:
+        return {
+            "erro": f"Erro de ligação: {erro}"
+        }
+
+    info = {
+        "status_http": r.status_code,
+        "url_consultada": url,
+    }
+
+    try:
+        dados = r.json()
+    except Exception:
+        info["resposta_texto"] = r.text[:1200]
+        return info
+
+    if isinstance(dados, dict):
+        info["campos_topo"] = list(dados.keys())
+
+        # Mostra estrutura sem qualquer informação de autenticação.
+        lista = _lista_tennis(dados)
+        info["quantidade_itens_interpretados"] = len(lista)
+
+        if lista:
+            primeiro = lista[0]
+            if isinstance(primeiro, dict):
+                info["campos_primeiro_item"] = list(primeiro.keys())
+                info["primeiro_item"] = primeiro
+            else:
+                info["primeiro_item"] = primeiro
+        else:
+            # Quando o nosso parser não encontrou a lista, precisamos
+            # ver a estrutura para descobrir onde os jogos estão.
+            info["resposta"] = dados
+
+    elif isinstance(dados, list):
+        info["tipo_resposta"] = "lista"
+        info["quantidade"] = len(dados)
+        if dados:
+            info["primeiro_item"] = dados[0]
+    else:
+        info["tipo_resposta"] = type(dados).__name__
+        info["resposta"] = str(dados)[:1200]
+
+    return info
+
+
 def dificuldade_tenis(jogo, valor):
     rank1 = jogo.get("rank_casa")
     rank2 = jogo.get("rank_fora")
@@ -3193,6 +3260,13 @@ with tab_prever:
                 "Não encontrei encontros futuros de "
                 f"{circuito} nos próximos 14 dias."
             )
+
+            with st.expander("🔧 Diagnóstico da API Tennis"):
+                st.caption(
+                    "Este bloco não mostra a tua chave de API."
+                )
+                diagnostico = diagnostico_tennis_api()
+                st.json(diagnostico)
 
         if jogos_tenis:
             indice_tenis = st.selectbox(
