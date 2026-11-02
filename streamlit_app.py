@@ -1895,37 +1895,27 @@ def buscar_jogos_tenis(circuito):
     agora = datetime.now(TZ)
     limite = agora + timedelta(days=30)
 
-    # A API real devolve 25 jogos por página.
-    # Primeiro tentamos filtrar diretamente pelo circuito.
-    # Se não vierem jogos utilizáveis, percorremos algumas páginas.
     circuitos_aceites = (
         {"atp", "challenger"}
         if circuito == "ATP"
         else {"wta"}
     )
 
-    pedidos = []
-
-    # Tentativa 1: filtro direto pelo circuito escolhido.
-    pedidos.append({
-        "circuit": circuito.lower(),
-        "date_from": agora.date().isoformat(),
-        "date_to": limite.date().isoformat(),
-        "limit": 100,
-    })
-
-    # Fallback: páginas gerais.
-    for pagina in range(1, 5):
-        pedidos.append({
-            "page": pagina,
-            "limit": 100,
-        })
-
     itens = []
     ids_vistos = set()
+    cursor = None
     ultimo_erro = None
 
-    for params in pedidos:
+    # A API usa cursor pagination através de meta.next_cursor.
+    # Limitamos a 3 páginas para proteger o plano gratuito.
+    for tentativa in range(3):
+        params = {
+            "circuit": circuito.lower(),
+        }
+
+        if cursor:
+            params["cursor"] = cursor
+
         try:
             r = requests.get(
                 url,
@@ -1937,22 +1927,21 @@ def buscar_jogos_tenis(circuito):
             ultimo_erro = (
                 f"Erro de ligação à API Tennis: {erro}"
             )
-            continue
+            break
 
         if r.status_code != 200:
             ultimo_erro = (
                 f"Erro API Tennis: {r.status_code}"
             )
-            continue
+            break
 
         try:
             dados = r.json()
         except Exception:
             ultimo_erro = (
-                "A API Tennis devolveu "
-                "uma resposta inválida."
+                "A API Tennis devolveu uma resposta inválida."
             )
-            continue
+            break
 
         lote = _lista_tennis(dados)
 
@@ -1966,7 +1955,11 @@ def buscar_jogos_tenis(circuito):
                 or item.get("event_id")
             )
 
-            chave = str(item_id) if item_id is not None else repr(item)
+            chave = (
+                str(item_id)
+                if item_id is not None
+                else repr(item)
+            )
 
             if chave in ids_vistos:
                 continue
@@ -1974,21 +1967,29 @@ def buscar_jogos_tenis(circuito):
             ids_vistos.add(chave)
             itens.append(item)
 
-        # Se a busca filtrada já trouxe vários encontros do
-        # circuito, não precisamos gastar mais pedidos.
-        if params.get("circuit"):
-            encontrados_circuito = 0
+        # Se já houver pelo menos alguns encontros do circuito
+        # escolhido, não precisamos continuar a gastar pedidos.
+        encontrados = sum(
+            1
+            for item in lote
+            if str(
+                item.get("circuit") or ""
+            ).strip().lower() in circuitos_aceites
+        )
 
-            for item in lote:
-                circ = str(
-                    item.get("circuit") or ""
-                ).strip().lower()
+        if encontrados >= 3:
+            break
 
-                if circ in circuitos_aceites:
-                    encontrados_circuito += 1
+        meta = (
+            dados.get("meta", {})
+            if isinstance(dados, dict)
+            else {}
+        )
 
-            if encontrados_circuito >= 5:
-                break
+        cursor = meta.get("next_cursor")
+
+        if not cursor:
+            break
 
     if not itens and ultimo_erro:
         return [], ultimo_erro
@@ -2009,9 +2010,6 @@ def buscar_jogos_tenis(circuito):
     jogos = []
 
     for item in itens:
-        if not isinstance(item, dict):
-            continue
-
         status = _status_tennis(item)
 
         if status in estados_finais:
@@ -2021,11 +2019,9 @@ def buscar_jogos_tenis(circuito):
             item.get("circuit") or ""
         ).strip().lower()
 
-        # Usamos o campo real "circuit" observado na API.
         if circuito_item not in circuitos_aceites:
             continue
 
-        # Apenas singles.
         if item.get("doubles") is True:
             continue
 
@@ -2054,7 +2050,6 @@ def buscar_jogos_tenis(circuito):
             or p2.get("player_name")
         )
 
-        # Alguns encontros ainda não têm jogadores definidos.
         if not nome1 or not nome2:
             continue
 
@@ -2089,110 +2084,6 @@ def buscar_jogos_tenis(circuito):
         jogo.pop("data_obj", None)
 
     return jogos[:50], None
-
-
-
-@st.cache_data(ttl=60, show_spinner=False)
-def diagnostico_meta_tennis():
-    """
-    Faz uma única chamada segura à API Tennis e resume:
-    - meta/paginação
-    - circuitos presentes
-    - intervalo de datas visível
-    - quantidade de jogos com jogadores definidos
-    Não mostra a chave de API.
-    """
-    if not TENNIS_API_KEY:
-        return {"erro": "TENNIS_API_KEY não configurada."}
-
-    url = f"{TENNIS_API_BASE}/matches"
-
-    try:
-        r = requests.get(
-            url,
-            headers=headers_tennis(),
-            timeout=20,
-        )
-    except requests.RequestException as erro:
-        return {"erro": f"Erro de ligação: {erro}"}
-
-    info = {
-        "status_http": r.status_code,
-    }
-
-    try:
-        dados = r.json()
-    except Exception:
-        info["resposta_texto"] = r.text[:1000]
-        return info
-
-    if not isinstance(dados, dict):
-        info["tipo_resposta"] = type(dados).__name__
-        return info
-
-    info["meta"] = dados.get("meta")
-
-    itens = _lista_tennis(dados)
-    info["itens_na_pagina"] = len(itens)
-
-    circuitos = Counter()
-    datas = []
-    com_jogadores = 0
-    exemplos = []
-
-    for item in itens:
-        if not isinstance(item, dict):
-            continue
-
-        circuito = str(item.get("circuit") or "NULL")
-        circuitos[circuito] += 1
-
-        data = item.get("date")
-        if data:
-            datas.append(str(data))
-
-        p1, p2 = _players_tennis(item)
-        nome1 = None
-        nome2 = None
-
-        if p1:
-            nome1 = (
-                p1.get("name")
-                or p1.get("full_name")
-                or p1.get("player_name")
-            )
-
-        if p2:
-            nome2 = (
-                p2.get("name")
-                or p2.get("full_name")
-                or p2.get("player_name")
-            )
-
-        if nome1 and nome2:
-            com_jogadores += 1
-
-        if len(exemplos) < 5:
-            exemplos.append({
-                "id": item.get("id"),
-                "date": item.get("date"),
-                "circuit": item.get("circuit"),
-                "status": item.get("status"),
-                "doubles": item.get("doubles"),
-                "player1": nome1,
-                "player2": nome2,
-            })
-
-    info["circuitos_na_pagina"] = dict(circuitos)
-    info["jogos_com_2_jogadores_definidos"] = com_jogadores
-
-    if datas:
-        info["primeira_data_visivel"] = min(datas)
-        info["ultima_data_visivel"] = max(datas)
-
-    info["exemplos"] = exemplos
-
-    return info
 
 
 def dificuldade_tenis(jogo, valor):
@@ -3386,12 +3277,6 @@ with tab_prever:
                 f"{circuito} nos próximos 30 dias."
             )
 
-            with st.expander("🔧 Diagnóstico de paginação do ténis"):
-                st.caption(
-                    "Mostra apenas meta, circuitos e datas. "
-                    "A tua chave não aparece."
-                )
-                st.json(diagnostico_meta_tennis())
 
 
         if jogos_tenis:
