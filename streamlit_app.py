@@ -2091,6 +2091,110 @@ def buscar_jogos_tenis(circuito):
     return jogos[:50], None
 
 
+
+@st.cache_data(ttl=60, show_spinner=False)
+def diagnostico_meta_tennis():
+    """
+    Faz uma única chamada segura à API Tennis e resume:
+    - meta/paginação
+    - circuitos presentes
+    - intervalo de datas visível
+    - quantidade de jogos com jogadores definidos
+    Não mostra a chave de API.
+    """
+    if not TENNIS_API_KEY:
+        return {"erro": "TENNIS_API_KEY não configurada."}
+
+    url = f"{TENNIS_API_BASE}/matches"
+
+    try:
+        r = requests.get(
+            url,
+            headers=headers_tennis(),
+            timeout=20,
+        )
+    except requests.RequestException as erro:
+        return {"erro": f"Erro de ligação: {erro}"}
+
+    info = {
+        "status_http": r.status_code,
+    }
+
+    try:
+        dados = r.json()
+    except Exception:
+        info["resposta_texto"] = r.text[:1000]
+        return info
+
+    if not isinstance(dados, dict):
+        info["tipo_resposta"] = type(dados).__name__
+        return info
+
+    info["meta"] = dados.get("meta")
+
+    itens = _lista_tennis(dados)
+    info["itens_na_pagina"] = len(itens)
+
+    circuitos = Counter()
+    datas = []
+    com_jogadores = 0
+    exemplos = []
+
+    for item in itens:
+        if not isinstance(item, dict):
+            continue
+
+        circuito = str(item.get("circuit") or "NULL")
+        circuitos[circuito] += 1
+
+        data = item.get("date")
+        if data:
+            datas.append(str(data))
+
+        p1, p2 = _players_tennis(item)
+        nome1 = None
+        nome2 = None
+
+        if p1:
+            nome1 = (
+                p1.get("name")
+                or p1.get("full_name")
+                or p1.get("player_name")
+            )
+
+        if p2:
+            nome2 = (
+                p2.get("name")
+                or p2.get("full_name")
+                or p2.get("player_name")
+            )
+
+        if nome1 and nome2:
+            com_jogadores += 1
+
+        if len(exemplos) < 5:
+            exemplos.append({
+                "id": item.get("id"),
+                "date": item.get("date"),
+                "circuit": item.get("circuit"),
+                "status": item.get("status"),
+                "doubles": item.get("doubles"),
+                "player1": nome1,
+                "player2": nome2,
+            })
+
+    info["circuitos_na_pagina"] = dict(circuitos)
+    info["jogos_com_2_jogadores_definidos"] = com_jogadores
+
+    if datas:
+        info["primeira_data_visivel"] = min(datas)
+        info["ultima_data_visivel"] = max(datas)
+
+    info["exemplos"] = exemplos
+
+    return info
+
+
 def dificuldade_tenis(jogo, valor):
     rank1 = jogo.get("rank_casa")
     rank2 = jogo.get("rank_fora")
@@ -3281,6 +3385,13 @@ with tab_prever:
                 "Não encontrei encontros futuros de "
                 f"{circuito} nos próximos 30 dias."
             )
+
+            with st.expander("🔧 Diagnóstico de paginação do ténis"):
+                st.caption(
+                    "Mostra apenas meta, circuitos e datas. "
+                    "A tua chave não aparece."
+                )
+                st.json(diagnostico_meta_tennis())
 
 
         if jogos_tenis:
