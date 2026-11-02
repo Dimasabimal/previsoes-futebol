@@ -1624,25 +1624,72 @@ def _lista_tennis(dados):
 
 def _nome_torneio_tennis(item):
     torneio = item.get("tournament")
+
     if isinstance(torneio, dict):
-        return (
+        nome = (
             torneio.get("name")
             or torneio.get("title")
-            or "Torneio"
         )
+        if nome:
+            return str(nome)
+
     if torneio:
         return str(torneio)
 
-    comp = item.get("competition")
-    if isinstance(comp, dict):
-        return comp.get("name") or "Torneio"
-    if comp:
-        return str(comp)
+    edicao = item.get("edition")
+    if isinstance(edicao, dict):
+        nome = edicao.get("name")
+        if nome:
+            return str(nome)
 
     return "Torneio"
 
 
 def _players_tennis(item):
+    # Formato real da api.tennis:
+    # "sides": [
+    #   {"side": 1, "players": [{"id": ..., "name": ...}]},
+    #   {"side": 2, "players": [{"id": ..., "name": ...}]}
+    # ]
+    sides = item.get("sides")
+
+    if isinstance(sides, list) and len(sides) >= 2:
+        lados = {}
+
+        for lado in sides:
+            if not isinstance(lado, dict):
+                continue
+
+            numero = lado.get("side")
+            jogadores = lado.get("players") or []
+
+            jogador = None
+
+            # Singles: normalmente há apenas 1 jogador por lado.
+            if isinstance(jogadores, list) and jogadores:
+                candidato = jogadores[0]
+                if isinstance(candidato, dict):
+                    jogador = dict(candidato)
+                elif candidato:
+                    jogador = {"name": str(candidato)}
+
+            # Alguns registos podem trazer equipa/entry em vez de player.
+            if jogador is None:
+                equipa = lado.get("team")
+                if isinstance(equipa, dict):
+                    jogador = dict(equipa)
+                elif equipa:
+                    jogador = {"name": str(equipa)}
+
+            if jogador is not None:
+                jogador["_side"] = numero
+                jogador["_winner"] = bool(lado.get("winner"))
+                lados[numero] = jogador
+
+        if 1 in lados and 2 in lados:
+            return lados[1], lados[2]
+
+    # Fallback para outros formatos possíveis.
     jogadores = item.get("players")
 
     if isinstance(jogadores, list) and len(jogadores) >= 2:
@@ -1772,47 +1819,52 @@ def _parse_data_tennis(item):
 
 
 def _tour_tennis(item):
+    circuito = str(item.get("circuit") or "").strip().lower()
+
+    # Valores reais observados na api.tennis.
+    if circuito in {"atp", "challenger"}:
+        return "ATP"
+
+    if circuito == "wta":
+        return "WTA"
+
+    # ITF/Fed/Davis/etc. não entram quando o utilizador escolhe ATP/WTA.
+    if circuito in {
+        "itf",
+        "fed",
+        "davis",
+        "utr",
+        "exhibition",
+    }:
+        return circuito.upper()
+
     valores = [
-        item.get("tour"),
         item.get("category"),
         item.get("gender"),
-        item.get("circuit"),
         item.get("event_type"),
-        item.get("event_type_type"),
-        item.get("type"),
-        item.get("competition_type"),
+        item.get("level_name"),
     ]
 
     torneio = item.get("tournament")
     if isinstance(torneio, dict):
         valores.extend([
-            torneio.get("tour"),
+            torneio.get("name"),
             torneio.get("category"),
             torneio.get("gender"),
-            torneio.get("type"),
-            torneio.get("name"),
         ])
-    elif torneio:
-        valores.append(torneio)
 
     texto = " ".join(
         str(v) for v in valores if v
     ).lower()
 
-    if (
-        "wta" in texto
-        or "women" in texto
-        or "female" in texto
-        or "women singles" in texto
-    ):
+    if "wta" in texto or "women" in texto or "female" in texto:
         return "WTA"
 
     if (
         "atp" in texto
+        or "challenger" in texto
         or "men" in texto
         or "male" in texto
-        or "men singles" in texto
-        or "challenger" in texto
     ):
         return "ATP"
 
@@ -1952,6 +2004,8 @@ def buscar_jogos_tenis(circuito):
             or p2.get("player_name")
         )
 
+        # Alguns encontros futuros muito distantes vêm sem os nomes
+        # dos jogadores ainda definidos. Esses não podem ser previstos.
         if not nome1 or not nome2:
             continue
 
@@ -2125,89 +2179,83 @@ def buscar_resultado_tenis(evento_id):
         "complete",
         "retired",
         "walkover",
+        "ended",
+        "closed",
     }
 
     if not terminado:
-        return {
-            "status": "PENDING",
-        }
+        return {"status": "PENDING"}
 
     p1, p2 = _players_tennis(item)
     if not p1 or not p2:
         return None
 
-    nome1 = p1.get("name") or p1.get("full_name")
-    nome2 = p2.get("name") or p2.get("full_name")
-
-    vencedor = item.get("winner")
-    vencedor_nome = None
-
-    if isinstance(vencedor, dict):
-        vencedor_nome = (
-            vencedor.get("name")
-            or vencedor.get("full_name")
-        )
-    elif vencedor:
-        vencedor_nome = str(vencedor)
+    nome1 = (
+        p1.get("name")
+        or p1.get("full_name")
+        or p1.get("player_name")
+    )
+    nome2 = (
+        p2.get("name")
+        or p2.get("full_name")
+        or p2.get("player_name")
+    )
 
     vencedor_indice = None
 
-    if vencedor_nome:
-        if vencedor_nome == nome1:
-            vencedor_indice = 0
-        elif vencedor_nome == nome2:
-            vencedor_indice = 1
+    # Campo real observado na resposta.
+    winner_side = item.get("winner_side")
+    try:
+        if winner_side is not None:
+            vencedor_indice = int(winner_side) - 1
+    except Exception:
+        pass
 
-    # Fallback: alguns feeds marcam o vencedor dentro do jogador.
+    # Fallback pelo campo winner dentro de sides.
     if vencedor_indice is None:
-        if isinstance(p1, dict) and p1.get("winner") is True:
+        if p1.get("_winner") is True:
             vencedor_indice = 0
-        elif isinstance(p2, dict) and p2.get("winner") is True:
+        elif p2.get("_winner") is True:
             vencedor_indice = 1
 
-    # Fallback pelo número de sets.
-    score = item.get("score") or {}
-    sets = score.get("sets") if isinstance(score, dict) else None
-
-    if vencedor_indice is None and isinstance(sets, list):
-        s1 = 0
-        s2 = 0
-        for parcial in sets:
-            if (
-                isinstance(parcial, (list, tuple))
-                and len(parcial) >= 2
-            ):
-                try:
-                    a = int(parcial[0])
-                    b = int(parcial[1])
-                except Exception:
-                    continue
-
-                if a > b:
-                    s1 += 1
-                elif b > a:
-                    s2 += 1
-
-        if s1 > s2:
-            vencedor_indice = 0
-        elif s2 > s1:
-            vencedor_indice = 1
-
-    if vencedor_indice is None:
+    if vencedor_indice not in [0, 1]:
         return None
 
     placar = ""
-    if isinstance(sets, list):
-        partes = []
-        for parcial in sets:
-            if (
-                isinstance(parcial, (list, tuple))
-                and len(parcial) >= 2
-            ):
-                partes.append(
-                    f"{parcial[0]}-{parcial[1]}"
-                )
-        placar = ", ".join(partes)
+
+    score = item.get("score")
+    if score is not None:
+        if isinstance(score, str):
+            placar = score
+        elif isinstance(score, (dict, list)):
+            placar = str(score)
+
+    if not placar:
+        sets = item.get("sets")
+        if isinstance(sets, list):
+            partes = []
+            for parcial in sets:
+                if isinstance(parcial, dict):
+                    a = (
+                        parcial.get("side1")
+                        or parcial.get("player1")
+                        or parcial.get("home")
+                    )
+                    b = (
+                        parcial.get("side2")
+                        or parcial.get("player2")
+                        or parcial.get("away")
+                    )
+                    if a is not None and b is not None:
+                        partes.append(f"{a}-{b}")
+                elif (
+                    isinstance(parcial, (list, tuple))
+                    and len(parcial) >= 2
+                ):
+                    partes.append(
+                        f"{parcial[0]}-{parcial[1]}"
+                    )
+            placar = ", ".join(partes)
 
     return {
         "status": "FINISHED",
@@ -3261,12 +3309,6 @@ with tab_prever:
                 f"{circuito} nos próximos 14 dias."
             )
 
-            with st.expander("🔧 Diagnóstico da API Tennis"):
-                st.caption(
-                    "Este bloco não mostra a tua chave de API."
-                )
-                diagnostico = diagnostico_tennis_api()
-                st.json(diagnostico)
 
         if jogos_tenis:
             indice_tenis = st.selectbox(
