@@ -1791,11 +1791,26 @@ def _parse_data_tennis(item):
             valor = f"{valor}T{hora}"
 
         try:
-            dt = datetime.fromisoformat(
-                str(valor).replace("Z", "+00:00")
-            )
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=TZ)
+            valor_str = str(valor)
+
+            # Quando a API devolve apenas YYYY-MM-DD,
+            # não há hora exata. Usamos 12:00 para evitar
+            # eliminar jogos de hoje por estarem a "00:00".
+            if (
+                len(valor_str) == 10
+                and valor_str[4] == "-"
+                and valor_str[7] == "-"
+            ):
+                dt = datetime.fromisoformat(
+                    valor_str + "T12:00:00"
+                ).replace(tzinfo=TZ)
+            else:
+                dt = datetime.fromisoformat(
+                    valor_str.replace("Z", "+00:00")
+                )
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=TZ)
+
             return dt.astimezone(TZ)
         except Exception:
             pass
@@ -1890,20 +1905,23 @@ def buscar_jogos_tenis(circuito):
             "nos Secrets do Streamlit."
         )
 
-    # Para previsões futuras usamos /matches com filtros explícitos.
     url = f"{TENNIS_API_BASE}/matches"
 
     agora = datetime.now(TZ)
     limite = agora + timedelta(days=30)
 
-    circuito_api = "atp" if circuito == "ATP" else "wta"
+    # A documentação usa:
+    # atp = ATP Tour
+    # ch = Challenger
+    # wta = WTA
+    circuit_param = "atp,ch" if circuito == "ATP" else "wta"
+    circuitos_aceites = {"atp", "ch"} if circuito == "ATP" else {"wta"}
 
     params = {
         "from": agora.date().isoformat(),
         "to": limite.date().isoformat(),
-        "circuit": circuito_api,
+        "circuit": circuit_param,
         "doubles": "false",
-        "status": "scheduled",
         "limit": 100,
     }
 
@@ -1926,27 +1944,36 @@ def buscar_jogos_tenis(circuito):
         return [], "A API Tennis devolveu uma resposta inválida."
 
     itens = _lista_tennis(dados)
-
     jogos = []
 
     for item in itens:
         if not isinstance(item, dict):
             continue
 
-        # Apenas o circuito escolhido.
         circuito_item = str(
             item.get("circuit") or ""
         ).strip().lower()
 
-        if circuito_item != circuito_api:
+        if circuito_item not in circuitos_aceites:
             continue
 
-        # Apenas singles.
         if item.get("doubles") is True:
             continue
 
+        # Não exigimos status=scheduled.
+        # A documentação indica também "unknown" para jogos ainda sem estado final.
         status = _status_tennis(item)
-        if status not in {"scheduled", "unknown", ""}:
+        if status in {
+            "completed",
+            "finished",
+            "final",
+            "retired",
+            "walkover",
+            "defaulted",
+            "abandoned",
+            "cancelled",
+            "canceled",
+        }:
             continue
 
         dt = _parse_data_tennis(item)
@@ -1954,7 +1981,10 @@ def buscar_jogos_tenis(circuito):
         if dt is None:
             continue
 
-        if dt < agora or dt > limite:
+        if dt < agora - timedelta(hours=12):
+            continue
+
+        if dt > limite:
             continue
 
         p1, p2 = _players_tennis(item)
@@ -1967,7 +1997,6 @@ def buscar_jogos_tenis(circuito):
             or p1.get("full_name")
             or p1.get("player_name")
         )
-
         nome2 = (
             p2.get("name")
             or p2.get("full_name")
@@ -1993,7 +2022,7 @@ def buscar_jogos_tenis(circuito):
             "casa": nome1,
             "fora": nome2,
             "liga": _nome_torneio_tennis(item),
-            "data": dt.strftime("%d/%m/%Y %H:%M"),
+            "data": dt.strftime("%d/%m/%Y"),
             "data_obj": dt,
             "fonte_api": "api_tennis",
             "modalidade": "Ténis",
