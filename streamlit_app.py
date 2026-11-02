@@ -24,6 +24,7 @@ SUPABASE_SECRET_KEY = st.secrets["SUPABASE_SECRET_KEY"]
 FOOTBALL_API_KEY = st.secrets["FOOTBALL_API_KEY"]
 BRASILEIRAO_API_KEY = st.secrets.get("BRASILEIRAO_API_KEY", "")
 TENNIS_API_KEY = st.secrets.get("TENNIS_API_KEY", "")
+MMA_API_KEY = st.secrets.get("MMA_API_KEY", "")
 
 # Cookie encriptado para manter a sessão iniciada entre visitas.
 # A chave privada do servidor é usada apenas como palavra-passe de encriptação.
@@ -56,6 +57,7 @@ NOMES_TIPOS = {
     "ambas_marcam": "Ambas as equipas marcam",
     "dupla_possibilidade": "Dupla possibilidade",
     "tenis_vencedor": "Vencedor do encontro",
+    "mma_vencedor": "Vencedor da luta",
 }
 
 MINIMO_RANKING_PRECISAO = 10
@@ -295,6 +297,14 @@ def melhor_liga(lista):
 
 
 def equipa_associada_previsao(p):
+    if modalidade_previsao(p) == "MMA":
+        valor = p.get("valor_previsao")
+        if valor == "Lutador1":
+            return p.get("casa")
+        if valor == "Lutador2":
+            return p.get("fora")
+        return None
+
     if modalidade_previsao(p) == "Ténis":
         valor = p.get("valor_previsao")
         if valor == "Jogador1":
@@ -2273,6 +2283,209 @@ def buscar_resultado_tenis(evento_id):
 
 
 
+
+# =========================================================
+# API MMA / UFC
+# =========================================================
+
+MMA_API_BASE = "https://v1.mma.api-sports.io"
+
+
+def headers_mma():
+    return {
+        "x-apisports-key": MMA_API_KEY,
+        "Accept": "application/json",
+    }
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def buscar_lutas_mma():
+    if not MMA_API_KEY:
+        return [], (
+            "MMA_API_KEY não está configurada "
+            "nos Secrets do Streamlit."
+        )
+
+    url = f"{MMA_API_BASE}/fights"
+    params = {
+        "season": datetime.now(TZ).year,
+        "timezone": "Europe/Lisbon",
+    }
+
+    try:
+        r = requests.get(
+            url,
+            headers=headers_mma(),
+            params=params,
+            timeout=20,
+        )
+    except requests.RequestException as erro:
+        return [], f"Erro de ligação à API MMA: {erro}"
+
+    if r.status_code != 200:
+        return [], f"Erro API MMA: {r.status_code}"
+
+    try:
+        dados = r.json()
+    except Exception:
+        return [], "A API MMA devolveu uma resposta inválida."
+
+    erros = dados.get("errors")
+    if erros:
+        return [], f"API MMA: {erros}"
+
+    agora = datetime.now(TZ)
+    limite = agora + timedelta(days=60)
+
+    lutas = []
+
+    for item in dados.get("response", []):
+        if not isinstance(item, dict):
+            continue
+
+        status = item.get("status") or {}
+        status_short = str(
+            status.get("short") or ""
+        ).upper()
+
+        if status_short not in {"NS", "PF", "IN"}:
+            continue
+
+        slug = str(item.get("slug") or "")
+        if "ufc" not in slug.lower():
+            continue
+
+        valor_data = item.get("date")
+        if not valor_data:
+            continue
+
+        try:
+            dt = datetime.fromisoformat(
+                str(valor_data).replace("Z", "+00:00")
+            )
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+            dt = dt.astimezone(TZ)
+        except Exception:
+            continue
+
+        if dt <= agora or dt > limite:
+            continue
+
+        fighters = item.get("fighters") or {}
+        first = fighters.get("first") or {}
+        second = fighters.get("second") or {}
+
+        nome1 = first.get("name")
+        nome2 = second.get("name")
+
+        if not nome1 or not nome2:
+            continue
+
+        luta_id = item.get("id")
+        if luta_id is None:
+            continue
+
+        lutas.append({
+            "evento_id": str(luta_id),
+            "jogo": f"{nome1} vs {nome2}",
+            "casa": nome1,
+            "fora": nome2,
+            "liga": slug or "UFC",
+            "data": dt.strftime("%d/%m/%Y %H:%M"),
+            "data_obj": dt,
+            "fonte_api": "api_mma",
+            "modalidade": "MMA",
+            "categoria": item.get("category") or "",
+            "is_main": bool(item.get("is_main")),
+        })
+
+    lutas.sort(
+        key=lambda x: (
+            x["data_obj"],
+            not x.get("is_main", False),
+        )
+    )
+
+    for luta in lutas:
+        luta.pop("data_obj", None)
+
+    return lutas[:80], None
+
+
+def dificuldade_mma(luta, valor):
+    # Primeira versão: dificuldade neutra.
+    # Evita chamadas extra à API por lutador.
+    return "Média", 1.5
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def buscar_resultado_mma(evento_id):
+    if not MMA_API_KEY or not evento_id:
+        return None
+
+    url = f"{MMA_API_BASE}/fights"
+
+    try:
+        r = requests.get(
+            url,
+            headers=headers_mma(),
+            params={"id": evento_id},
+            timeout=20,
+        )
+    except requests.RequestException:
+        return None
+
+    if r.status_code != 200:
+        return None
+
+    try:
+        dados = r.json()
+    except Exception:
+        return None
+
+    resposta = dados.get("response") or []
+    if not resposta:
+        return None
+
+    item = resposta[0]
+    status = item.get("status") or {}
+    status_short = str(
+        status.get("short") or ""
+    ).upper()
+
+    if status_short != "FT":
+        return {"status": "PENDING"}
+
+    fighters = item.get("fighters") or {}
+    first = fighters.get("first") or {}
+    second = fighters.get("second") or {}
+
+    vencedor_indice = None
+
+    if first.get("winner") is True:
+        vencedor_indice = 0
+    elif second.get("winner") is True:
+        vencedor_indice = 1
+
+    if vencedor_indice is None:
+        return None
+
+    vencedor_nome = (
+        first.get("name")
+        if vencedor_indice == 0
+        else second.get("name")
+    )
+
+    return {
+        "status": "FINISHED",
+        "winner_index": vencedor_indice,
+        "winner_name": vencedor_nome or "",
+        "placar": "",
+    }
+
+
+
 # =========================================================
 # RESULTADOS AUTOMÁTICOS
 # =========================================================
@@ -2477,12 +2690,16 @@ def atualizar_resultados_automaticamente():
     pendentes_football_data = []
     pendentes_brasileirao = []
     pendentes_tenis = []
+    pendentes_mma = []
 
     for p in pendentes:
         fonte = p.get("fonte_api")
         modalidade = modalidade_previsao(p)
 
-        if modalidade == "Ténis" or fonte == "api_tennis":
+        if modalidade == "MMA" or fonte == "api_mma":
+            if jogo_comecou(p):
+                pendentes_mma.append(p)
+        elif modalidade == "Ténis" or fonte == "api_tennis":
             # Só consultar a API depois da hora prevista do encontro,
             # para poupar o limite mensal.
             if jogo_comecou(p):
@@ -2585,6 +2802,35 @@ def atualizar_resultados_automaticamente():
             previsao["id"],
             placar,
             resultado_real,
+            "Acertou" if acertou else "Errou",
+        )
+
+        if (
+            r is not None
+            and r.status_code in [200, 204]
+        ):
+            atualizados += 1
+
+    # MMA / UFC
+    for previsao in pendentes_mma:
+        resultado = buscar_resultado_mma(
+            previsao.get("evento_id")
+        )
+
+        if not resultado:
+            continue
+
+        if resultado.get("status") != "FINISHED":
+            continue
+
+        valor = previsao.get("valor_previsao")
+        escolhido = 0 if valor == "Lutador1" else 1
+        acertou = escolhido == resultado.get("winner_index")
+
+        r = atualizar_previsao_admin(
+            previsao["id"],
+            resultado.get("placar") or "",
+            resultado.get("winner_name") or "",
             "Acertou" if acertou else "Errou",
         )
 
@@ -2756,6 +3002,12 @@ def verificar_contradicao(
 # =========================================================
 
 def opcoes_para_tipo(tipo, jogo):
+    if tipo == "mma_vencedor":
+        return {
+            jogo.get("casa", "Lutador 1"): "Lutador1",
+            jogo.get("fora", "Lutador 2"): "Lutador2",
+        }
+
     if tipo == "tenis_vencedor":
         return {
             jogo.get("casa", "Jogador 1"): "Jogador1",
@@ -2813,6 +3065,11 @@ def opcoes_para_tipo(tipo, jogo):
 
 
 def texto_previsao(tipo, valor, jogo):
+    if tipo == "mma_vencedor":
+        if valor == "Lutador1":
+            return f"{jogo.get('casa')} vence"
+        return f"{jogo.get('fora')} vence"
+
     if tipo == "tenis_vencedor":
         if valor == "Jogador1":
             return f"{jogo.get('casa')} vence"
@@ -3290,7 +3547,7 @@ with tab_prever:
 
     modalidade = st.selectbox(
         "Modalidade",
-        ["⚽ Futebol", "🎾 Ténis"],
+        ["⚽ Futebol", "🎾 Ténis", "🥋 MMA/UFC"],
         key="modalidade_prever",
     )
 
@@ -3481,6 +3738,169 @@ with tab_prever:
                         )
                         if r is not None:
                             st.code(r.text)
+
+    elif modalidade == "🥋 MMA/UFC":
+        with st.spinner("A carregar lutas UFC..."):
+            lutas_mma, erro_mma = buscar_lutas_mma()
+
+        if erro_mma:
+            st.error(erro_mma)
+            lutas_mma = []
+
+        if not lutas_mma and not erro_mma:
+            st.info(
+                "Não encontrei lutas UFC futuras "
+                "nos próximos 60 dias."
+            )
+
+        if lutas_mma:
+            indice_mma = st.selectbox(
+                "Escolhe a luta",
+                options=range(len(lutas_mma)),
+                format_func=lambda i: (
+                    f"{lutas_mma[i]['data']} — "
+                    f"{lutas_mma[i]['jogo']} "
+                    f"({lutas_mma[i]['categoria']})"
+                ),
+                key="indice_mma_novo",
+            )
+
+            luta = lutas_mma[indice_mma]
+
+            existentes_mma = [
+                p for p in minhas
+                if (
+                    modalidade_previsao(p) == "MMA"
+                    and str(p.get("evento_id"))
+                    == str(luta["evento_id"])
+                )
+            ]
+
+            ja_tem_mma = any(
+                p.get("tipo_previsao") == "mma_vencedor"
+                for p in existentes_mma
+            )
+
+            opcoes_mma = opcoes_para_tipo(
+                "mma_vencedor",
+                luta,
+            )
+
+            label_mma = st.selectbox(
+                "Quem vence?",
+                list(opcoes_mma.keys()),
+                key=f"mma_valor_{luta['evento_id']}",
+            )
+
+            valor_mma = opcoes_mma[label_mma]
+
+            confianca_mma = st.select_slider(
+                "Confiança",
+                options=[1, 2, 3, 4, 5],
+                value=3,
+                key=f"mma_conf_{luta['evento_id']}",
+            )
+
+            dificuldade_mma_nome, multiplicador_mma = (
+                dificuldade_mma(luta, valor_mma)
+            )
+
+            texto_mma = texto_previsao(
+                "mma_vencedor",
+                valor_mma,
+                luta,
+            )
+
+            st.info(
+                f"🥋 {texto_mma}\n\n"
+                f"Dificuldade: **{dificuldade_mma_nome} "
+                f"×{multiplicador_mma:g}** • "
+                f"Se acertar: **"
+                f"{formatar_pontos(confianca_mma * multiplicador_mma)} "
+                f"pontos** • "
+                f"Se errar: **-{confianca_mma} pontos**"
+            )
+
+            if st.button(
+                "Guardar previsão de MMA",
+                type="primary",
+                key=f"guardar_mma_{luta['evento_id']}",
+            ):
+                if jogo_comecou(luta):
+                    st.error("A luta já começou.")
+                elif ja_tem_mma:
+                    st.warning(
+                        "Já tens uma previsão para esta luta."
+                    )
+                else:
+                    lutador_previsto = (
+                        luta["casa"]
+                        if valor_mma == "Lutador1"
+                        else luta["fora"]
+                    )
+
+                    registo_mma = {
+                        "user_id":
+                            st.session_state["user_id"],
+                        "utilizador":
+                            st.session_state["nome"],
+                        "modalidade":
+                            "MMA",
+                        "evento_id":
+                            luta["evento_id"],
+                        "match_id":
+                            None,
+                        "fonte_api":
+                            "api_mma",
+                        "jogo":
+                            luta["jogo"],
+                        "casa":
+                            luta["casa"],
+                        "fora":
+                            luta["fora"],
+                        "liga":
+                            luta["liga"],
+                        "data":
+                            luta["data"],
+                        "previsao":
+                            texto_mma,
+                        "tipo_previsao":
+                            "mma_vencedor",
+                        "valor_previsao":
+                            valor_mma,
+                        "equipa_previsao":
+                            lutador_previsto,
+                        "confianca":
+                            confianca_mma,
+                        "dificuldade":
+                            dificuldade_mma_nome,
+                        "multiplicador":
+                            multiplicador_mma,
+                        "placar":
+                            "",
+                        "resultado":
+                            "Pendente",
+                        "resultado_real":
+                            None,
+                    }
+
+                    r = guardar_previsao(registo_mma)
+
+                    if (
+                        r is not None
+                        and r.status_code in [200, 201]
+                    ):
+                        st.success(
+                            "✅ Previsão de MMA guardada!"
+                        )
+                        st.rerun()
+                    else:
+                        st.error(
+                            "Não foi possível guardar."
+                        )
+                        if r is not None:
+                            st.code(r.text)
+
 
     else:
         liga = st.selectbox(
@@ -3771,7 +4191,7 @@ with tab_minhas:
     with c0:
         filtro_modalidade = st.selectbox(
             "Modalidade",
-            ["Todas", "Futebol", "Ténis"],
+            ["Todas", "Futebol", "Ténis", "MMA"],
             key="filtro_modalidade_minhas",
         )
 
@@ -4235,7 +4655,7 @@ with tab_historico:
 with tab_ranking:
     modalidade_ranking = st.radio(
         "Modalidade",
-        ["Geral", "Futebol", "Ténis"],
+        ["Geral", "Futebol", "Ténis", "MMA"],
         horizontal=True,
         key="modalidade_ranking",
     )
