@@ -2144,6 +2144,9 @@ def consultar_horarios_complementares(circuito):
                     _normalizar_nome_tenis(nome1),
                     _normalizar_nome_tenis(nome2),
                 }),
+                "jogador1": nome1,
+                "jogador2": nome2,
+                "chave_unica": str(identificador_unico),
                 "torneio": nome_torneio or "",
                 "data": dt,
                 "origem": str(item.get("startTimeSource") or "").lower(),
@@ -2154,38 +2157,115 @@ def consultar_horarios_complementares(circuito):
     return resultados, erro, diagnostico
 
 
+def _partes_nome_tenis(nome):
+    """Separa nomes sem acentos, preservando iniciais e apelido final."""
+    base = unicodedata.normalize("NFKD", str(nome or "").casefold())
+    base = "".join(c for c in base if not unicodedata.combining(c))
+    return re.findall(r"[a-z]+", base)
+
+
+def _jogador_equivalente_tenis(a, b):
+    """Correspondência conservadora: apelido + primeiro nome/inicial."""
+    if _normalizar_nome_tenis(a) == _normalizar_nome_tenis(b):
+        return bool(_normalizar_nome_tenis(a))
+    pa, pb = _partes_nome_tenis(a), _partes_nome_tenis(b)
+    if len(pa) < 2 or len(pb) < 2:
+        return False
+    # Evita trocar pessoas que partilham apelido.
+    if pa[-1] != pb[-1] or pa[0][0] != pb[0][0]:
+        return False
+    # Se ambos têm primeiro nome escrito por extenso, exigir igualdade.
+    if len(pa[0]) > 1 and len(pb[0]) > 1 and pa[0] != pb[0]:
+        return False
+    return True
+
+
+def _mesmos_jogadores_tenis(jogo, calendario):
+    a, b = jogo.get("casa"), jogo.get("fora")
+    c, e = calendario.get("jogador1"), calendario.get("jogador2")
+    return (
+        (_jogador_equivalente_tenis(a, c) and _jogador_equivalente_tenis(b, e))
+        or (_jogador_equivalente_tenis(a, e) and _jogador_equivalente_tenis(b, c))
+    )
+
+
 def completar_horarios_tenis(jogos, circuito):
-    diagnostico = {"chave_no_streamlit": bool(TENNIS_SCHEDULE_API_KEY),
-                   "encontros_originais": len(jogos), "correspondencias": 0}
+    diagnostico = {
+        "chave_no_streamlit": bool(TENNIS_SCHEDULE_API_KEY),
+        "encontros_originais": len(jogos),
+        "correspondencias": 0,
+    }
     if not jogos:
         return jogos, None, diagnostico
+
     programacao, erro, diagnostico_api = consultar_horarios_complementares(circuito)
     diagnostico.update(diagnostico_api)
     if erro:
         return jogos, erro, diagnostico
+
+    # Um jogo complementar não pode ser atribuído a dois jogos originais.
+    usados = set()
+    motivos = {"sem_jogadores_equivalentes": 0,
+               "torneio_diferente": 0,
+               "data_demasiado_distante": 0,
+               "correspondencia_ambigua": 0}
+    exemplos_sem_correspondencia = []
+    exemplos_corrigidos = []
+
     for jogo in jogos:
-        nomes = frozenset({
-            _normalizar_nome_tenis(jogo.get("casa")),
-            _normalizar_nome_tenis(jogo.get("fora")),
-        })
         dt_antiga = parse_data_jogo(jogo.get("data"))
-        if len(nomes) != 2 or dt_antiga is None:
+        if dt_antiga is None:
             continue
-        candidatos = [c for c in programacao
-            if c["nomes"] == nomes
-            and _mesma_competicao_tenis(jogo.get("liga"), c["torneio"])
-            and abs((c["data"].date() - dt_antiga.date()).days) <= 2]
-        if len(candidatos) != 1:
+
+        pares = [c for c in programacao if _mesmos_jogadores_tenis(jogo, c)]
+        mesma_competicao = [c for c in pares if _mesma_competicao_tenis(
+            jogo.get("liga"), c.get("torneio"))]
+        candidatos = [c for c in mesma_competicao
+                      if abs((c["data"].date() - dt_antiga.date()).days) <= 3
+                      and c["chave_unica"] not in usados]
+        if not pares:
+            motivo = "sem_jogadores_equivalentes"
+        elif not mesma_competicao:
+            motivo = "torneio_diferente"
+        elif not candidatos:
+            motivo = "data_demasiado_distante"
+        elif len(candidatos) != 1:
+            motivo = "correspondencia_ambigua"
+        else:
+            motivo = None
+
+        if motivo:
+            motivos[motivo] += 1
+            if len(exemplos_sem_correspondencia) < 8:
+                exemplos_sem_correspondencia.append({
+                    "jogo": jogo.get("jogo"),
+                    "torneio": jogo.get("liga"),
+                    "motivo": motivo,
+                })
             continue
+
         candidato = candidatos[0]
+        usados.add(candidato["chave_unica"])
         dt = candidato["data"]
+        data_anterior = jogo["data"]
         jogo["data"] = dt.strftime("%d/%m/%Y %H:%M")
         jogo["data_corrigida"] = True
+        # A hora é prevista, NÃO é prova de que o jogo ainda não começou.
+        # No próprio dia exige-se confirmação independente do estado ao vivo.
         jogo["hora_confirmada"] = False
         jogo["horario_previsto"] = True
         jogo["origem_horario"] = candidato["origem"] or "calendário"
         jogo["id_suplementar"] = candidato["id_suplementar"]
         diagnostico["correspondencias"] += 1
+        if len(exemplos_corrigidos) < 8:
+            exemplos_corrigidos.append({
+                "jogo": jogo.get("jogo"), "antes": data_anterior,
+                "depois": jogo["data"],
+            })
+
+    diagnostico["motivos_sem_correspondencia"] = motivos
+    diagnostico["exemplos_sem_correspondencia"] = exemplos_sem_correspondencia
+    diagnostico["exemplos_corrigidos"] = exemplos_corrigidos
     jogos.sort(key=lambda x: parse_data_jogo(x.get("data")) or datetime.max.replace(tzinfo=TZ))
     return jogos, None, diagnostico
 
