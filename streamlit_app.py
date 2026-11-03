@@ -1989,103 +1989,120 @@ def _status_tennis(item):
     return str(status or "").strip().lower()
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)
 def buscar_jogos_tenis(circuito):
+    """Consulta cada circuito e devolve um diagnóstico sem revelar tokens."""
     if not TENNIS_API_KEY:
-        return [], "TENNIS_API_KEY não está configurada nos Secrets."
+        return [], "TENNIS_API_KEY não configurada.", {}
 
     agora = datetime.now(TZ)
     inicio = agora.date()
+    fim = inicio + timedelta(days=7)
     url = f"{TENNIS_API_BASE}/matches"
     circuitos = {"atp", "ch"} if circuito == "ATP" else {"wta"}
-    # Primeiro ATP principal, depois Challenger. Isto evita que os
-    # encontros de Challenger ocupem as primeiras 100 posições e
-    # escondam um Masters 1000 como Paris.
-    pesquisas = (["atp", "ch"] if circuito == "ATP" else ["wta"])
+    pesquisas = ["atp", "ch"] if circuito == "ATP" else ["wta"]
     itens = []
     erros = []
+    diagnostico = {"intervalo": f"{inicio} a {fim}", "pedidos": [], "excluidos": {}, "amostras": []}
 
     for codigo in pesquisas:
-        # Intervalo curto, porque a API ordena da data mais recente
-        # para a mais antiga. Uma janela longa esconde jogos de hoje.
         params = {
             "from": inicio.isoformat(),
-            "to": (inicio + timedelta(days=7)).isoformat(),
+            "to": fim.isoformat(),
             "circuit": codigo,
             "doubles": "false",
             "limit": 100,
         }
         r, erro = tennis_get(url, params=params, timeout=20)
+        pedido = {"circuito": codigo}
         if erro:
+            pedido["erro"] = str(erro)[:150]
             erros.append(erro)
-            continue
-        if r is None or r.status_code != 200:
-            erros.append(f"Erro API Tennis: {r.status_code if r else 'sem resposta'}")
-            continue
-        try:
-            dados = r.json()
-        except ValueError:
-            erros.append("A API Tennis devolveu uma resposta inválida.")
-            continue
-        itens.extend(_lista_tennis(dados))
+        elif r is None:
+            pedido["erro"] = "Sem resposta"
+            erros.append("Sem resposta da API")
+        else:
+            pedido["http"] = r.status_code
+            if r.status_code != 200:
+                erros.append(f"API Tennis: HTTP {r.status_code}")
+            else:
+                try:
+                    dados = r.json()
+                    lista = _lista_tennis(dados)
+                    pedido["total"] = len(lista)
+                    if isinstance(dados, dict):
+                        meta = dados.get("meta") or {}
+                        if isinstance(meta, dict):
+                            pedido["meta_count"] = meta.get("count")
+                            pedido["tem_proxima_pagina"] = bool(meta.get("next_cursor"))
+                    itens.extend(lista)
+                except ValueError:
+                    erros.append("Resposta da API inválida")
+                    pedido["erro"] = "JSON inválido"
+        diagnostico["pedidos"].append(pedido)
 
-    # Um jogo só pode aparecer uma vez, mesmo que haja repetições da API.
-    jogos = []
+    excluidos = {"circuito":0, "terminado_ou_duplas":0, "data_invalida":0,
+                 "hoje_sem_hora_ou_iniciado":0, "jogadores_ausentes":0,
+                 "id_ausente_ou_repetido":0}
     vistos = set()
-    terminados = {
-        "completed", "finished", "final", "retired", "walkover",
-        "defaulted", "abandoned", "cancelled", "canceled", "ended",
-    }
+    jogos = []
+    terminados = {"completed","finished","final","retired","walkover",
+                  "defaulted","abandoned","cancelled","canceled","ended"}
     for item in itens:
         if not isinstance(item, dict):
             continue
+        if len(diagnostico["amostras"]) < 5:
+            diagnostico["amostras"].append({
+                "data": item.get("date"),
+                "circuito": item.get("circuit"),
+                "estado": item.get("status"),
+                "torneio": _nome_torneio_tennis(item),
+                "lados": len(item.get("sides") or []),
+            })
         if str(item.get("circuit") or "").strip().lower() not in circuitos:
+            excluidos["circuito"] += 1
             continue
         if item.get("doubles") is True or _status_tennis(item) in terminados:
+            excluidos["terminado_ou_duplas"] += 1
             continue
         dt = _parse_data_tennis(item)
-        if dt is None or dt.date() < inicio or dt.date() > inicio + timedelta(days=7):
+        if dt is None or dt.date() < inicio or dt.date() > fim:
+            excluidos["data_invalida"] += 1
             continue
-        # Não conhecemos a hora em registos que têm apenas YYYY-MM-DD.
-        # Excluímos os de hoje para não permitir escolhas após o início.
         tem_hora = any(item.get(k) for k in (
-            "start_time", "scheduled_at", "scheduled", "start_at",
-            "datetime", "start", "start_timestamp", "timestamp",
-            "time", "event_time", "start_time_local",
-        ))
+            "start_time", "scheduled_at", "scheduled", "start_at", "datetime",
+            "start", "start_timestamp", "timestamp", "time", "event_time", "start_time_local"))
         if dt.date() == inicio and (not tem_hora or dt <= agora):
+            excluidos["hoje_sem_hora_ou_iniciado"] += 1
             continue
-        p1,p2 = _players_tennis(item)
-        if not p1 or not p2:
+        p1, p2 = _players_tennis(item)
+        nome1 = (p1 or {}).get("name") or (p1 or {}).get("full_name") or (p1 or {}).get("player_name")
+        nome2 = (p2 or {}).get("name") or (p2 or {}).get("full_name") or (p2 or {}).get("player_name")
+        if not nome1 or not nome2:
+            excluidos["jogadores_ausentes"] += 1
             continue
-        nome1 = p1.get("name") or p1.get("full_name") or p1.get("player_name")
-        nome2 = p2.get("name") or p2.get("full_name") or p2.get("player_name")
         eid = item.get("id") or item.get("match_id") or item.get("event_id") or item.get("key")
-        if not nome1 or not nome2 or eid is None or str(eid) in vistos:
+        if eid is None or str(eid) in vistos:
+            excluidos["id_ausente_ou_repetido"] += 1
             continue
         vistos.add(str(eid))
         jogos.append({
-            "evento_id": str(eid),
-            "jogo": f"{nome1} vs {nome2}",
-            "casa": nome1,
-            "fora": nome2,
+            "evento_id": str(eid), "jogo": f"{nome1} vs {nome2}",
+            "casa": nome1, "fora": nome2,
             "liga": _nome_torneio_tennis(item),
             "data": dt.strftime("%d/%m/%Y %H:%M") if tem_hora else dt.strftime("%d/%m/%Y"),
-            "data_obj": dt,
-            "fonte_api": "api_tennis",
-            "modalidade": "Ténis",
-            "circuito": circuito,
-            "rank_casa": _rank_tennis(p1),
-            "rank_fora": _rank_tennis(p2),
+            "data_obj": dt, "fonte_api": "api_tennis", "modalidade": "Ténis",
+            "circuito": circuito, "rank_casa": _rank_tennis(p1), "rank_fora": _rank_tennis(p2),
         })
-    # Apresentar primeiro jogos ATP, incluindo o Masters de Paris,
-    # e só depois Challengers.
-    jogos.sort(key=lambda j: (0 if circuito == "ATP" and "challenger" not in str(j["liga"]).lower() else 1, j["data_obj"]))
+    jogos.sort(key=lambda j: (0 if circuito == "ATP" and "challenger" not in j["liga"].lower() else 1, j["data_obj"]))
     for jogo in jogos:
         jogo.pop("data_obj", None)
+    diagnostico["total_recebido"] = len(itens)
+    diagnostico["total_disponivel"] = len(jogos)
+    diagnostico["excluidos"] = excluidos
     if not jogos and erros:
-        return [], "; ".join(dict.fromkeys(erros))
-    return jogos[:100], None
+        return [], "; ".join(dict.fromkeys(erros)), diagnostico
+    return jogos[:100], None, diagnostico
 
 
 def dificuldade_tenis(jogo, valor):
@@ -3679,7 +3696,7 @@ with tab_prever:
         )
 
         with st.spinner("A carregar encontros de ténis..."):
-            jogos_tenis, erro_tenis = buscar_jogos_tenis(circuito)
+            jogos_tenis, erro_tenis, diag_tenis = buscar_jogos_tenis(circuito)
 
         if erro_tenis:
             if "limitar pedidos" in erro_tenis.lower():
@@ -3699,6 +3716,10 @@ with tab_prever:
 
 
 
+
+        if not jogos_tenis:
+            with st.expander("🔧 Diagnóstico ATP/WTA (sem mostrar a chave)"):
+                st.json(diag_tenis)
 
         if jogos_tenis:
             indice_tenis = st.selectbox(
