@@ -2040,15 +2040,14 @@ def _mesma_competicao_tenis(a, b):
     return bool(aa and bb and (aa in bb or bb in aa))
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=21600, show_spinner=False)
 def consultar_horarios_complementares(circuito):
-    """Consulta somente horários e devolve diagnóstico seguro, sem credenciais."""
+    """Procura ATP/WTA principais sem consumir a quota com ITF nas primeiras páginas."""
     diagnostico = {
         "chave_no_streamlit": bool(TENNIS_SCHEDULE_API_KEY),
-        "circuito": circuito,
-        "pedidos": [],
-        "encontros_interpretados": 0,
-        "amostras": [],
+        "circuito": circuito, "pedidos": [],
+        "encontros_interpretados": 0, "amostras": [],
+        "filtro": "torneios principais e Paris Masters",
     }
     if not TENNIS_SCHEDULE_API_KEY:
         return [], "Chave do calendário não configurada nos Secrets.", diagnostico
@@ -2061,73 +2060,98 @@ def consultar_horarios_complementares(circuito):
         "Accept": "application/json",
     }
     hoje = datetime.now(TZ).date()
+    base = {
+        "group": "singles",
+        "dateFrom": (hoje - timedelta(days=1)).isoformat(),
+        "dateTo": (hoje + timedelta(days=8)).isoformat(),
+        "limit": 100,
+        "page": 1,
+        "include": "fixtureDetails,metadata",
+    }
+    # O dataset atp inclui também ITF/Challenger. Um filtro de rank
+    # limita a pesquisa aos níveis principais; a pesquisa específica
+    # por Paris evita que o Masters se perca entre dezenas de torneios.
+    consultas = [
+        ("torneios principais", {**base, "rank": "2,3"}),
+    ]
+    if circuito.upper() == "ATP":
+        consultas.insert(0, (
+            "Paris Masters", {**base, "tournament": "Paris"}
+        ))
+
     resultados = []
-    try:
-        for pagina in (1, 2):
+    ids_vistos = set()
+    falhas = []
+    for descricao, parametros in consultas:
+        try:
             resposta = requests.get(
-                url, headers=headers,
-                params={
-                    "group": "singles",
-                    "dateFrom": (hoje - timedelta(days=1)).isoformat(),
-                    "dateTo": (hoje + timedelta(days=8)).isoformat(),
-                    "sortBy": "startTime",
-                    "limit": 50,
-                    "page": pagina,
-                },
-                timeout=20,
+                url, headers=headers, params=parametros, timeout=20
             )
-            reg = {"pagina": pagina, "http": resposta.status_code}
-            diagnostico["pedidos"].append(reg)
-            if resposta.status_code != 200:
-                return resultados, f"Calendário complementar: HTTP {resposta.status_code}", diagnostico
+        except requests.RequestException:
+            falhas.append(f"{descricao}: ligação indisponível")
+            continue
+        reg = {"pesquisa": descricao, "http": resposta.status_code}
+        diagnostico["pedidos"].append(reg)
+        if resposta.status_code != 200:
+            falhas.append(f"{descricao}: HTTP {resposta.status_code}")
+            continue
+        try:
             corpo = resposta.json()
-            reg["campos_resposta"] = list(corpo.keys())[:12] if isinstance(corpo, dict) else [type(corpo).__name__]
-            lista = corpo.get("matches") or [] if isinstance(corpo, dict) else []
-            reg["encontros_devolvidos"] = len(lista) if isinstance(lista, list) else 0
-            if not isinstance(lista, list):
-                break
-            if lista and isinstance(lista[0], dict):
-                reg["campos_primeiro_encontro"] = list(lista[0].keys())[:30]
-            for item in lista:
-                if not isinstance(item, dict):
-                    continue
-                p1 = item.get("player1") or {}
-                p2 = item.get("player2") or {}
-                torneio = item.get("tournament") or {}
-                data_iso = item.get("startTime") or item.get("start_time") or item.get("date")
-                if len(diagnostico["amostras"]) < 3:
-                    diagnostico["amostras"].append({
-                        "jogador1": str(p1.get("name") or p1.get("fullName") or "") if isinstance(p1, dict) else str(p1)[:60],
-                        "jogador2": str(p2.get("name") or p2.get("fullName") or "") if isinstance(p2, dict) else str(p2)[:60],
-                        "torneio": str(torneio.get("name") or "") if isinstance(torneio, dict) else str(torneio)[:60],
-                        "horario": str(data_iso)[:35],
-                    })
-                if not isinstance(p1, dict) or not isinstance(p2, dict) or not data_iso:
-                    continue
-                try:
-                    data = datetime.fromisoformat(str(data_iso).replace("Z", "+00:00"))
-                    if data.tzinfo is None:
-                        continue
-                    data = data.astimezone(TZ)
-                except (TypeError, ValueError):
-                    continue
-                nome_torneio = torneio.get("name") if isinstance(torneio, dict) else str(torneio)
-                resultados.append({
-                    "nomes": frozenset({
-                        _normalizar_nome_tenis(p1.get("name") or p1.get("fullName")),
-                        _normalizar_nome_tenis(p2.get("name") or p2.get("fullName")),
-                    }),
-                    "torneio": nome_torneio or "",
-                    "data": data,
-                    "origem": str(item.get("startTimeSource") or "").lower(),
-                    "id_suplementar": str(item.get("matchId") or item.get("id") or ""),
+        except (ValueError, TypeError):
+            falhas.append(f"{descricao}: JSON inválido")
+            continue
+        lista = corpo.get("matches") or [] if isinstance(corpo, dict) else []
+        reg["encontros_devolvidos"] = len(lista) if isinstance(lista, list) else 0
+        reg["total_api"] = corpo.get("total") if isinstance(corpo, dict) else None
+        reg["mais_paginas"] = corpo.get("hasNextPage") if isinstance(corpo, dict) else None
+        if not isinstance(lista, list):
+            continue
+        for item in lista:
+            if not isinstance(item, dict):
+                continue
+            p1 = item.get("player1") or {}
+            p2 = item.get("player2") or {}
+            torneio = item.get("tournament") or {}
+            data_iso = item.get("startTime") or item.get("start_time") or item.get("date")
+            nome1 = (p1.get("name") or p1.get("fullName")) if isinstance(p1, dict) else None
+            nome2 = (p2.get("name") or p2.get("fullName")) if isinstance(p2, dict) else None
+            nome_torneio = torneio.get("name") if isinstance(torneio, dict) else str(torneio)
+            if len(diagnostico["amostras"]) < 5:
+                diagnostico["amostras"].append({
+                    "pesquisa": descricao, "jogador1": nome1,
+                    "jogador2": nome2, "torneio": nome_torneio,
+                    "horario": str(data_iso)[:35],
                 })
-            if not corpo.get("hasNextPage"):
-                break
-    except (requests.RequestException, ValueError, TypeError):
-        return [], "Não foi possível contactar o calendário complementar.", diagnostico
+            if not nome1 or not nome2 or not data_iso:
+                continue
+            try:
+                dt = datetime.fromisoformat(str(data_iso).replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    continue
+                dt = dt.astimezone(TZ)
+            except (TypeError, ValueError):
+                continue
+            identificador = str(item.get("matchId") or item.get("id") or "")
+            identificador_unico = identificador or (
+                _normalizar_nome_tenis(nome1),
+                _normalizar_nome_tenis(nome2), dt.isoformat()
+            )
+            if identificador_unico in ids_vistos:
+                continue
+            ids_vistos.add(identificador_unico)
+            resultados.append({
+                "nomes": frozenset({
+                    _normalizar_nome_tenis(nome1),
+                    _normalizar_nome_tenis(nome2),
+                }),
+                "torneio": nome_torneio or "",
+                "data": dt,
+                "origem": str(item.get("startTimeSource") or "").lower(),
+                "id_suplementar": identificador,
+            })
     diagnostico["encontros_interpretados"] = len(resultados)
-    return resultados, None, diagnostico
+    erro = "; ".join(falhas) if falhas and not resultados else None
+    return resultados, erro, diagnostico
 
 
 def completar_horarios_tenis(jogos, circuito):
