@@ -24,6 +24,7 @@ SUPABASE_SECRET_KEY = st.secrets["SUPABASE_SECRET_KEY"]
 FOOTBALL_API_KEY = st.secrets["FOOTBALL_API_KEY"]
 BRASILEIRAO_API_KEY = st.secrets.get("BRASILEIRAO_API_KEY", "")
 TENNIS_API_KEY = st.secrets.get("TENNIS_API_KEY", "")
+TENNIS_SCHEDULE_API_KEY = st.secrets.get("TENNIS_SCHEDULE_API_KEY", "")
 MMA_API_KEY = st.secrets.get("MMA_API_KEY", "")
 UFC_API_KEY = st.secrets.get("UFC_API_KEY", "")
 
@@ -2019,6 +2020,136 @@ def hora_confirmada_tenis(evento_id, data_original):
         return None
 
 
+# =========================================================
+# HORÁRIOS COMPLEMENTARES: Tennis API / RapidAPI
+# =========================================================
+
+TENNIS_SCHEDULE_HOST = "tennis-api-atp-wta-itf.p.rapidapi.com"
+
+
+def _normalizar_nome_tenis(valor):
+    texto = unicodedata.normalize("NFKD", str(valor or "").casefold())
+    texto = "".join(c for c in texto if not unicodedata.combining(c))
+    return re.sub(r"[^a-z0-9]", "", texto)
+
+
+def _mesma_competicao_tenis(a, b):
+    # Sem confirmação de torneio, não misturar confrontos semelhantes.
+    aa = _normalizar_nome_tenis(a)
+    bb = _normalizar_nome_tenis(b)
+    return bool(aa and bb and (aa in bb or bb in aa))
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def consultar_horarios_complementares(circuito):
+    """Só usa calendário: ignora deliberadamente odds e previsões da fonte."""
+    if not TENNIS_SCHEDULE_API_KEY:
+        return [], "TENNIS_SCHEDULE_API_KEY não configurada."
+
+    url = (
+        f"https://{TENNIS_SCHEDULE_HOST}"
+        f"/tennis/v2/upcoming/matches/{circuito.lower()}"
+    )
+    headers = {
+        "X-RapidAPI-Key": TENNIS_SCHEDULE_API_KEY,
+        "X-RapidAPI-Host": TENNIS_SCHEDULE_HOST,
+        "Accept": "application/json",
+    }
+    hoje = datetime.now(TZ).date()
+    # Duas páginas para captar tanto ATP principal como WTA/Challenger.
+    # Cache de 6h para proteger a quota gratuita.
+    resultados = []
+    try:
+        for pagina in (1, 2):
+            resposta = requests.get(
+                url, headers=headers,
+                params={
+                    "group": "singles",
+                    "dateFrom": (hoje - timedelta(days=1)).isoformat(),
+                    "dateTo": (hoje + timedelta(days=8)).isoformat(),
+                    "sortBy": "startTime",
+                    "include": "fixtureDetails,metadata",
+                    "limit": 100,
+                    "page": pagina,
+                },
+                timeout=20,
+            )
+            if resposta.status_code != 200:
+                return [], f"Calendário complementar: HTTP {resposta.status_code}"
+            corpo = resposta.json()
+            lista = corpo.get("matches") or []
+            if not isinstance(lista, list):
+                break
+            for item in lista:
+                if not isinstance(item, dict):
+                    continue
+                p1 = item.get("player1") or {}
+                p2 = item.get("player2") or {}
+                data_iso = item.get("startTime") or item.get("date")
+                if not data_iso:
+                    continue
+                try:
+                    data = datetime.fromisoformat(str(data_iso).replace("Z", "+00:00"))
+                    if data.tzinfo is None:
+                        continue
+                    data = data.astimezone(TZ)
+                except (TypeError, ValueError):
+                    continue
+                torneio = item.get("tournament") or {}
+                nome_torneio = torneio.get("name") if isinstance(torneio, dict) else str(torneio)
+                resultados.append({
+                    "nomes": frozenset({
+                        _normalizar_nome_tenis(p1.get("name")),
+                        _normalizar_nome_tenis(p2.get("name")),
+                    }),
+                    "torneio": nome_torneio or "",
+                    "data": data,
+                    "origem": str(item.get("startTimeSource") or "").lower(),
+                    "id_suplementar": str(item.get("matchId") or item.get("id") or ""),
+                })
+            if not corpo.get("hasNextPage"):
+                break
+    except (requests.RequestException, ValueError, TypeError) as e:
+        return [], "Não foi possível consultar o calendário complementar."
+    return resultados, None
+
+
+def completar_horarios_tenis(jogos, circuito):
+    if not jogos or not TENNIS_SCHEDULE_API_KEY:
+        return jogos, None
+    programacao, erro = consultar_horarios_complementares(circuito)
+    if erro:
+        return jogos, erro
+
+    for jogo in jogos:
+        nomes = frozenset({
+            _normalizar_nome_tenis(jogo.get("casa")),
+            _normalizar_nome_tenis(jogo.get("fora")),
+        })
+        dt_antiga = parse_data_jogo(jogo.get("data"))
+        if len(nomes) != 2 or dt_antiga is None:
+            continue
+        candidatos = [
+            candidato for candidato in programacao
+            if candidato["nomes"] == nomes
+            and _mesma_competicao_tenis(jogo.get("liga"), candidato["torneio"])
+            and abs((candidato["data"].date() - dt_antiga.date()).days) <= 2
+        ]
+        # Em caso de ambiguidade, manter data original em vez de confundir jogos.
+        if len(candidatos) != 1:
+            continue
+        candidato = candidatos[0]
+        dt = candidato["data"]
+        jogo["data"] = dt.strftime("%d/%m/%Y %H:%M")
+        jogo["data_corrigida"] = True
+        jogo["hora_confirmada"] = False  # horário previsto, não início verificado
+        jogo["horario_previsto"] = True
+        jogo["origem_horario"] = candidato["origem"] or "calendário"
+        jogo["id_suplementar"] = candidato["id_suplementar"]
+    jogos.sort(key=lambda x: parse_data_jogo(x.get("data")) or datetime.max.replace(tzinfo=TZ))
+    return jogos, None
+
+
 def estado_previsao_tenis(jogo):
     """(aberto, motivo). Falha pelo lado seguro quando falta hora no dia."""
     agora = datetime.now(TZ)
@@ -2033,8 +2164,8 @@ def estado_previsao_tenis(jogo):
         return False, "O encontro já começou ou terminou."
     if not jogo.get("hora_confirmada"):
         if agora.date() >= dt.date():
-            return False, "Sem hora confirmada para hoje; previsões bloqueadas por segurança."
-        return True, "Apenas data disponível: previsões abertas até à véspera."
+            return False, "Sem confirmação de que ainda não começou hoje; previsões bloqueadas por segurança."
+        return True, "Encontro futuro: previsões abertas até à véspera; horário sujeito a alteração."
     if agora >= dt:
         return False, "A hora prevista do encontro já foi atingida."
     return True, "Horário individual confirmado."
@@ -3755,6 +3886,9 @@ with tab_prever:
 
         with st.spinner("A carregar encontros de ténis..."):
             jogos_tenis, erro_tenis, diag_tenis = buscar_jogos_tenis(circuito)
+            aviso_complementar = None
+            if jogos_tenis:
+                jogos_tenis, aviso_complementar = completar_horarios_tenis(jogos_tenis, circuito)
 
         if erro_tenis:
             if "limitar pedidos" in erro_tenis.lower():
@@ -3765,6 +3899,9 @@ with tab_prever:
             else:
                 st.error(erro_tenis)
             jogos_tenis = []
+
+        if jogos_tenis and aviso_complementar:
+            st.caption("Calendário complementar indisponível; horários originais mantidos.")
 
         if not jogos_tenis and not erro_tenis:
             st.info(
@@ -3798,8 +3935,13 @@ with tab_prever:
                 st.caption(f"✅ {aviso_horario}")
             else:
                 st.warning(f"🔒 {aviso_horario}")
-            if not jogo.get("hora_confirmada"):
-                st.caption(f"ID do encontro: {jogo['evento_id']} (para inserir um horário individual confirmado nos Secrets, se necessário)")
+            if jogo.get("horario_previsto"):
+                st.caption(
+                    "🕒 Data/hora prevista pelo calendário complementar; "
+                    "não é confirmação do início real."
+                )
+            elif not jogo.get("hora_confirmada"):
+                st.caption("A fonte atual só indica o dia; hora do encontro ainda por confirmar.")
             if "paris" in jogo.get("liga", "").lower():
                 st.caption("O horário previsto de cada encontro deve ser confirmado na ordem de jogos oficial, não na hora de abertura da sessão.")
                 st.markdown("[Consultar programação oficial do Rolex Paris Masters](https://tickets.rolexparismasters.com/en/programme-previsionnel)")
