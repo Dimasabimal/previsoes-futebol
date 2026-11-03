@@ -2040,24 +2040,27 @@ def _mesma_competicao_tenis(a, b):
     return bool(aa and bb and (aa in bb or bb in aa))
 
 
-@st.cache_data(ttl=21600, show_spinner=False)
+@st.cache_data(ttl=600, show_spinner=False)
 def consultar_horarios_complementares(circuito):
-    """Só usa calendário: ignora deliberadamente odds e previsões da fonte."""
+    """Consulta somente horários e devolve diagnóstico seguro, sem credenciais."""
+    diagnostico = {
+        "chave_no_streamlit": bool(TENNIS_SCHEDULE_API_KEY),
+        "circuito": circuito,
+        "pedidos": [],
+        "encontros_interpretados": 0,
+        "amostras": [],
+    }
     if not TENNIS_SCHEDULE_API_KEY:
-        return [], "TENNIS_SCHEDULE_API_KEY não configurada."
+        return [], "Chave do calendário não configurada nos Secrets.", diagnostico
 
-    url = (
-        f"https://{TENNIS_SCHEDULE_HOST}"
-        f"/tennis/v2/upcoming/matches/{circuito.lower()}"
-    )
+    url = (f"https://{TENNIS_SCHEDULE_HOST}"
+           f"/tennis/v2/upcoming/matches/{circuito.lower()}")
     headers = {
         "X-RapidAPI-Key": TENNIS_SCHEDULE_API_KEY,
         "X-RapidAPI-Host": TENNIS_SCHEDULE_HOST,
         "Accept": "application/json",
     }
     hoje = datetime.now(TZ).date()
-    # Duas páginas para captar tanto ATP principal como WTA/Challenger.
-    # Cache de 6h para proteger a quota gratuita.
     resultados = []
     try:
         for pagina in (1, 2):
@@ -2068,68 +2071,74 @@ def consultar_horarios_complementares(circuito):
                     "dateFrom": (hoje - timedelta(days=1)).isoformat(),
                     "dateTo": (hoje + timedelta(days=8)).isoformat(),
                     "sortBy": "startTime",
-                    "include": "fixtureDetails,metadata",
-                    "limit": 100,
+                    "limit": 50,
                     "page": pagina,
                 },
                 timeout=20,
             )
+            reg = {"pagina": pagina, "http": resposta.status_code}
+            diagnostico["pedidos"].append(reg)
             if resposta.status_code != 200:
-                return [], f"Calendário complementar: HTTP {resposta.status_code}"
+                return resultados, f"Calendário complementar: HTTP {resposta.status_code}", diagnostico
             corpo = resposta.json()
-            lista = corpo.get("matches")
-            if lista is None and isinstance(corpo.get("data"), dict):
-                lista = corpo["data"].get("matches")
+            reg["campos_resposta"] = list(corpo.keys())[:12] if isinstance(corpo, dict) else [type(corpo).__name__]
+            lista = corpo.get("matches") or [] if isinstance(corpo, dict) else []
+            reg["encontros_devolvidos"] = len(lista) if isinstance(lista, list) else 0
             if not isinstance(lista, list):
                 break
+            if lista and isinstance(lista[0], dict):
+                reg["campos_primeiro_encontro"] = list(lista[0].keys())[:30]
             for item in lista:
                 if not isinstance(item, dict):
                     continue
                 p1 = item.get("player1") or {}
                 p2 = item.get("player2") or {}
-                # Na resposta real desta API, a hora vem frequentemente
-                # no campo `date` (ISO 8601, normalmente em UTC).
-                data_iso = item.get("startTime") or item.get("date")
-                if not data_iso:
+                torneio = item.get("tournament") or {}
+                data_iso = item.get("startTime") or item.get("start_time") or item.get("date")
+                if len(diagnostico["amostras"]) < 3:
+                    diagnostico["amostras"].append({
+                        "jogador1": str(p1.get("name") or p1.get("fullName") or "") if isinstance(p1, dict) else str(p1)[:60],
+                        "jogador2": str(p2.get("name") or p2.get("fullName") or "") if isinstance(p2, dict) else str(p2)[:60],
+                        "torneio": str(torneio.get("name") or "") if isinstance(torneio, dict) else str(torneio)[:60],
+                        "horario": str(data_iso)[:35],
+                    })
+                if not isinstance(p1, dict) or not isinstance(p2, dict) or not data_iso:
                     continue
                 try:
                     data = datetime.fromisoformat(str(data_iso).replace("Z", "+00:00"))
                     if data.tzinfo is None:
-                        # Uma data sem fuso não é uma hora fiável.
                         continue
                     data = data.astimezone(TZ)
                 except (TypeError, ValueError):
                     continue
-                torneio = item.get("tournament") or {}
                 nome_torneio = torneio.get("name") if isinstance(torneio, dict) else str(torneio)
-                nomes = frozenset({
-                    _normalizar_nome_tenis(p1.get("name")),
-                    _normalizar_nome_tenis(p2.get("name")),
-                })
-                if len(nomes) != 2 or "" in nomes:
-                    continue
                 resultados.append({
-                    "nomes": nomes,
+                    "nomes": frozenset({
+                        _normalizar_nome_tenis(p1.get("name") or p1.get("fullName")),
+                        _normalizar_nome_tenis(p2.get("name") or p2.get("fullName")),
+                    }),
                     "torneio": nome_torneio or "",
                     "data": data,
-                    # Hora programada: não prova o estado ao vivo.
-                    "origem": str(item.get("startTimeSource") or "programado").lower(),
+                    "origem": str(item.get("startTimeSource") or "").lower(),
                     "id_suplementar": str(item.get("matchId") or item.get("id") or ""),
                 })
             if not corpo.get("hasNextPage"):
                 break
-    except (requests.RequestException, ValueError, TypeError) as e:
-        return [], "Não foi possível consultar o calendário complementar."
-    return resultados, None
+    except (requests.RequestException, ValueError, TypeError):
+        return [], "Não foi possível contactar o calendário complementar.", diagnostico
+    diagnostico["encontros_interpretados"] = len(resultados)
+    return resultados, None, diagnostico
 
 
 def completar_horarios_tenis(jogos, circuito):
-    if not jogos or not TENNIS_SCHEDULE_API_KEY:
-        return jogos, None
-    programacao, erro = consultar_horarios_complementares(circuito)
+    diagnostico = {"chave_no_streamlit": bool(TENNIS_SCHEDULE_API_KEY),
+                   "encontros_originais": len(jogos), "correspondencias": 0}
+    if not jogos:
+        return jogos, None, diagnostico
+    programacao, erro, diagnostico_api = consultar_horarios_complementares(circuito)
+    diagnostico.update(diagnostico_api)
     if erro:
-        return jogos, erro
-
+        return jogos, erro, diagnostico
     for jogo in jogos:
         nomes = frozenset({
             _normalizar_nome_tenis(jogo.get("casa")),
@@ -2138,25 +2147,23 @@ def completar_horarios_tenis(jogos, circuito):
         dt_antiga = parse_data_jogo(jogo.get("data"))
         if len(nomes) != 2 or dt_antiga is None:
             continue
-        candidatos = [
-            candidato for candidato in programacao
-            if candidato["nomes"] == nomes
-            and _mesma_competicao_tenis(jogo.get("liga"), candidato["torneio"])
-            and abs((candidato["data"].date() - dt_antiga.date()).days) <= 3
-        ]
-        # Em caso de ambiguidade, manter data original em vez de confundir jogos.
+        candidatos = [c for c in programacao
+            if c["nomes"] == nomes
+            and _mesma_competicao_tenis(jogo.get("liga"), c["torneio"])
+            and abs((c["data"].date() - dt_antiga.date()).days) <= 2]
         if len(candidatos) != 1:
             continue
         candidato = candidatos[0]
         dt = candidato["data"]
         jogo["data"] = dt.strftime("%d/%m/%Y %H:%M")
         jogo["data_corrigida"] = True
-        jogo["hora_confirmada"] = False  # horário previsto, não início verificado
+        jogo["hora_confirmada"] = False
         jogo["horario_previsto"] = True
         jogo["origem_horario"] = candidato["origem"] or "calendário"
         jogo["id_suplementar"] = candidato["id_suplementar"]
+        diagnostico["correspondencias"] += 1
     jogos.sort(key=lambda x: parse_data_jogo(x.get("data")) or datetime.max.replace(tzinfo=TZ))
-    return jogos, None
+    return jogos, None, diagnostico
 
 
 def estado_previsao_tenis(jogo):
@@ -2171,19 +2178,13 @@ def estado_previsao_tenis(jogo):
         "live", "in_progress", "playing", "in progress", "ongoing",
     }:
         return False, "O encontro já começou ou terminou."
-    # Um horário previsto não garante que o encontro não tenha já começado:
-    # no ténis, o início pode adiantar-se/atrasar-se. Sem validação ao vivo,
-    # no próprio dia preferimos bloquear previsões a aceitar uma tardia.
-    if dt.date() == agora.date():
-        return False, (
-            "Hoje: hora programada disponível, mas início real não verificado; "
-            "previsões bloqueadas por segurança."
-            if jogo.get("horario_previsto") or jogo.get("hora_confirmada")
-            else "Hoje sem hora/estado ao vivo confirmado; previsões bloqueadas por segurança."
-        )
-    if dt.date() < agora.date() or agora >= dt:
-        return False, "O horário previsto já passou."
-    return True, "Encontro futuro; previsões abertas até à véspera, sujeitas a alterações."
+    if not jogo.get("hora_confirmada"):
+        if agora.date() >= dt.date():
+            return False, "Sem confirmação de que ainda não começou hoje; previsões bloqueadas por segurança."
+        return True, "Encontro futuro: previsões abertas até à véspera; horário sujeito a alteração."
+    if agora >= dt:
+        return False, "A hora prevista do encontro já foi atingida."
+    return True, "Horário individual confirmado."
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -3902,8 +3903,7 @@ with tab_prever:
         with st.spinner("A carregar encontros de ténis..."):
             jogos_tenis, erro_tenis, diag_tenis = buscar_jogos_tenis(circuito)
             aviso_complementar = None
-            if jogos_tenis:
-                jogos_tenis, aviso_complementar = completar_horarios_tenis(jogos_tenis, circuito)
+            jogos_tenis, aviso_complementar, diag_complementar = completar_horarios_tenis(jogos_tenis, circuito)
 
         if erro_tenis:
             if "limitar pedidos" in erro_tenis.lower():
@@ -3916,12 +3916,12 @@ with tab_prever:
             jogos_tenis = []
 
         if jogos_tenis and aviso_complementar:
-            st.warning(
-                "Não foi possível atualizar os horários pela segunda API. "
-                "Os encontros continuam disponíveis com as restrições de segurança."
-            )
-            with st.expander("🔧 Estado do calendário complementar"):
-                st.write(aviso_complementar)
+            st.caption("Calendário complementar indisponível; horários originais mantidos.")
+
+        with st.expander("🔧 Estado do calendário complementar (sem mostrar a chave)"):
+            st.json(diag_complementar)
+            if aviso_complementar:
+                st.warning(aviso_complementar)
 
         if not jogos_tenis and not erro_tenis:
             st.info(
@@ -3957,8 +3957,8 @@ with tab_prever:
                 st.warning(f"🔒 {aviso_horario}")
             if jogo.get("horario_previsto"):
                 st.caption(
-                    "🕒 Data/hora de início programada pela Tennis API (RapidAPI), "
-                    "convertida para Portugal continental. Pode mudar."
+                    "🕒 Data/hora prevista pelo calendário complementar; "
+                    "não é confirmação do início real."
                 )
             elif not jogo.get("hora_confirmada"):
                 st.caption("A fonte atual só indica o dia; hora do encontro ainda por confirmar.")
