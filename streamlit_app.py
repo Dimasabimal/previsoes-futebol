@@ -1989,6 +1989,57 @@ def _status_tennis(item):
     return str(status or "").strip().lower()
 
 
+def hora_confirmada_tenis(evento_id, data_original):
+    """Hora individual confirmada manualmente com a ordem de jogos.
+
+    Opcional nos Secrets do Streamlit (hora de Portugal continental):
+
+    [TENNIS_HORARIOS]
+    "123456" = "2026-11-04 14:30"
+
+    Nunca usar horários gerais da sessão como hora de um encontro.
+    """
+    try:
+        configuracao = st.secrets.get("TENNIS_HORARIOS", {})
+        texto = configuracao.get(str(evento_id))
+    except (KeyError, AttributeError, TypeError):
+        return None
+
+    if not texto:
+        return None
+
+    try:
+        confirmado = datetime.strptime(
+            str(texto).strip(), "%Y-%m-%d %H:%M"
+        ).replace(tzinfo=TZ)
+        if confirmado.date() != data_original.date():
+            return None
+        return confirmado
+    except (ValueError, TypeError):
+        return None
+
+
+def estado_previsao_tenis(jogo):
+    """(aberto, motivo). Falha pelo lado seguro quando falta hora no dia."""
+    agora = datetime.now(TZ)
+    dt = parse_data_jogo(jogo.get("data"))
+    if dt is None:
+        return False, "Data do encontro desconhecida."
+    if jogo.get("estado_api") in {
+        "completed", "finished", "final", "retired", "walkover",
+        "defaulted", "abandoned", "cancelled", "canceled", "ended",
+        "live", "in_progress", "playing", "in progress", "ongoing",
+    }:
+        return False, "O encontro já começou ou terminou."
+    if not jogo.get("hora_confirmada"):
+        if agora.date() >= dt.date():
+            return False, "Sem hora confirmada para hoje; previsões bloqueadas por segurança."
+        return True, "Apenas data disponível: previsões abertas até à véspera."
+    if agora >= dt:
+        return False, "A hora prevista do encontro já foi atingida."
+    return True, "Horário individual confirmado."
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def buscar_jogos_tenis(circuito):
     """Consulta cada circuito e devolve um diagnóstico sem revelar tokens."""
@@ -2072,9 +2123,9 @@ def buscar_jogos_tenis(circuito):
         tem_hora = any(item.get(k) for k in (
             "start_time", "scheduled_at", "scheduled", "start_at", "datetime",
             "start", "start_timestamp", "timestamp", "time", "event_time", "start_time_local"))
-        if dt.date() == inicio and (not tem_hora or dt <= agora):
-            excluidos["hoje_sem_hora_ou_iniciado"] += 1
-            continue
+        # Manter encontros de hoje na lista, mesmo sem hora exata.
+        # O bloqueio é feito na interface e também ao guardar.
+        # Não usar 12:00 inventado como horário de início.
         p1, p2 = _players_tennis(item)
         nome1 = (p1 or {}).get("name") or (p1 or {}).get("full_name") or (p1 or {}).get("player_name")
         nome2 = (p2 or {}).get("name") or (p2 or {}).get("full_name") or (p2 or {}).get("player_name")
@@ -2086,12 +2137,19 @@ def buscar_jogos_tenis(circuito):
             excluidos["id_ausente_ou_repetido"] += 1
             continue
         vistos.add(str(eid))
+        horario_adicional = None
+        if not tem_hora:
+            horario_adicional = hora_confirmada_tenis(eid, dt)
+        horario_final = horario_adicional or dt
+        tem_hora_real = bool(tem_hora or horario_adicional)
         jogos.append({
             "evento_id": str(eid), "jogo": f"{nome1} vs {nome2}",
             "casa": nome1, "fora": nome2,
             "liga": _nome_torneio_tennis(item),
-            "data": dt.strftime("%d/%m/%Y %H:%M") if tem_hora else dt.strftime("%d/%m/%Y"),
-            "data_obj": dt, "fonte_api": "api_tennis", "modalidade": "Ténis",
+            "data": horario_final.strftime("%d/%m/%Y %H:%M") if tem_hora_real else dt.strftime("%d/%m/%Y"),
+            "data_obj": horario_final, "fonte_api": "api_tennis", "modalidade": "Ténis",
+            "hora_confirmada": tem_hora_real,
+            "estado_api": _status_tennis(item),
             "circuito": circuito, "rank_casa": _rank_tennis(p1), "rank_fora": _rank_tennis(p2),
         })
     jogos.sort(key=lambda j: (0 if circuito == "ATP" and "challenger" not in j["liga"].lower() else 1, j["data_obj"]))
@@ -3726,6 +3784,7 @@ with tab_prever:
                 "Escolhe o encontro",
                 options=range(len(jogos_tenis)),
                 format_func=lambda i: (
+                    f"{'✅' if estado_previsao_tenis(jogos_tenis[i])[0] else '🔒'} "
                     f"{jogos_tenis[i]['data']} — "
                     f"{jogos_tenis[i]['jogo']} "
                     f"({jogos_tenis[i]['liga']})"
@@ -3734,6 +3793,16 @@ with tab_prever:
             )
 
             jogo = jogos_tenis[indice_tenis]
+            previsao_aberta, aviso_horario = estado_previsao_tenis(jogo)
+            if previsao_aberta:
+                st.caption(f"✅ {aviso_horario}")
+            else:
+                st.warning(f"🔒 {aviso_horario}")
+            if not jogo.get("hora_confirmada"):
+                st.caption(f"ID do encontro: {jogo['evento_id']} (para inserir um horário individual confirmado nos Secrets, se necessário)")
+            if "paris" in jogo.get("liga", "").lower():
+                st.caption("O horário previsto de cada encontro deve ser confirmado na ordem de jogos oficial, não na hora de abertura da sessão.")
+                st.markdown("[Consultar programação oficial do Rolex Paris Masters](https://tickets.rolexparismasters.com/en/programme-previsionnel)")
 
             existentes = [
                 p for p in minhas
@@ -3801,11 +3870,11 @@ with tab_prever:
                 "Guardar previsão de ténis",
                 type="primary",
                 key=f"guardar_tenis_{jogo['evento_id']}",
+                disabled=not previsao_aberta,
             ):
-                if jogo_comecou(jogo):
-                    st.error(
-                        "O encontro já começou."
-                    )
+                aberto_agora, motivo_agora = estado_previsao_tenis(jogo)
+                if not aberto_agora:
+                    st.error(motivo_agora)
                 elif ja_tem:
                     st.warning(
                         "Já tens uma previsão para "
