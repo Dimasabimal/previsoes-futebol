@@ -3205,13 +3205,17 @@ with col_sair:
         terminar_sessao()
 
 
-# Atualização automática uma vez por sessão
-if "resultados_verificados" not in st.session_state:
-    atualizar_resultados_automaticamente()
-    st.session_state[
-        "resultados_verificados"
-    ] = True
-
+# O arranque da app não deve aguardar dezenas de pedidos a APIs.
+# Atualização de resultados fica disponível sob ação explícita do utilizador.
+with st.sidebar:
+    st.caption("Resultados e desempenho")
+    if st.button("🔄 Verificar resultados concluídos", key="atualizar_resultados_manual"):
+        with st.spinner("A verificar resultados..."):
+            try:
+                n_atualizados = atualizar_resultados_automaticamente()
+                st.success(f"{n_atualizados} previsões atualizadas.")
+            except Exception:
+                st.error("Não foi possível concluir a verificação de resultados.")
 
 previsoes = carregar_previsoes()
 
@@ -3234,30 +3238,43 @@ if concluidas_agora > concluidas_antes and concluidas_antes > 0:
         "foram atualizadas desde a última visita."
     )
 
-cookies["concluidas_vistas"] = str(concluidas_agora)
-cookies.save()
+# Evita chamar o componente de cookies em todos os reruns.
+if str(cookies.get("concluidas_vistas") or "") != str(concluidas_agora):
+    cookies["concluidas_vistas"] = str(concluidas_agora)
+    cookies.save()
 
 
 # =========================================================
 # TABS PRINCIPAIS
 # =========================================================
 
-tab_prever, tab_minhas, tab_stats, tab_historico, tab_ranking, tab_comparar, tab_perfis = st.tabs([
-    "⚽ Prever",
-    "📋 Minhas previsões",
-    "📊 Estatísticas",
-    "📜 Histórico",
-    "🏆 Ranking",
-    "⚖️ Comparar",
-    "👥 Perfis",
-])
+PAGINAS = {
+    "⚽ Prever": "tab_prever",
+    "📋 Minhas previsões": "tab_minhas",
+    "📊 Estatísticas": "tab_stats",
+    "📜 Histórico": "tab_historico",
+    "🏆 Ranking": "tab_ranking",
+    "⚖️ Comparar": "tab_comparar",
+    "👥 Perfis": "tab_perfis",
+}
+
+# Ao contrário de st.tabs, a navegação condicional só executa a página aberta.
+pagina_ativa = st.radio(
+    "Navegação",
+    options=list(PAGINAS),
+    index=0,
+    horizontal=True,
+    label_visibility="collapsed",
+    key="pagina_ativa",
+)
+
 
 
 # =========================================================
 # TAB — PREVER
 # =========================================================
 
-with tab_prever:
+if pagina_ativa == "⚽ Prever":
 
     st.subheader("Nova previsão")
 
@@ -3944,7 +3961,7 @@ with tab_prever:
 # TAB — MINHAS PREVISÕES
 # =========================================================
 
-with tab_minhas:
+if pagina_ativa == "📋 Minhas previsões":
 
     st.subheader("Filtros")
 
@@ -4326,7 +4343,7 @@ with tab_minhas:
 # TAB — ESTATÍSTICAS
 # =========================================================
 
-with tab_stats:
+if pagina_ativa == "📊 Estatísticas":
     mostrar_estatisticas_completas(minhas, prefixo="minhas")
 
 
@@ -4334,7 +4351,7 @@ with tab_stats:
 # TAB — HISTÓRICO DOS ÚLTIMOS 7 DIAS
 # =========================================================
 
-with tab_historico:
+if pagina_ativa == "📜 Histórico":
     st.subheader("📜 Histórico dos últimos 7 dias")
     st.caption("Todos podem consultar o histórico recente dos participantes.")
 
@@ -4428,7 +4445,7 @@ with tab_historico:
 # TAB — RANKING
 # =========================================================
 
-with tab_ranking:
+if pagina_ativa == "🏆 Ranking":
     modalidade_ranking = st.radio(
         "Modalidade",
         ["Geral", "Futebol", "Ténis", "MMA"],
@@ -4609,7 +4626,7 @@ with tab_ranking:
 # TAB — COMPARAR E CONSENSO
 # =========================================================
 
-with tab_comparar:
+if pagina_ativa == "⚖️ Comparar":
     nomes_comparar = sorted({
         p.get("utilizador") for p in previsoes if p.get("utilizador")
     })
@@ -4674,7 +4691,7 @@ with tab_comparar:
 # TAB — PERFIS
 # =========================================================
 
-with tab_perfis:
+if pagina_ativa == "👥 Perfis":
     nomes = sorted({
         p.get("utilizador")
         for p in previsoes
