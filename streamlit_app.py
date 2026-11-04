@@ -65,6 +65,8 @@ LIGAS = {
     "Serie A": "SA",
     "Bundesliga": "BL1",
     "Champions League": "CL",
+    "Liga Europa": "EL",
+    "Conference League": "UCL",
     "Brasileirão Série A": "API_FOOTBALL_BR",
 }
 
