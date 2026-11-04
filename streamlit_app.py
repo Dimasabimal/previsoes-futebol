@@ -1,6 +1,7 @@
 import streamlit as st
 import requests
 import re
+import hashlib
 import unicodedata
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -22,6 +23,7 @@ SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
 SUPABASE_SECRET_KEY = st.secrets["SUPABASE_SECRET_KEY"]
 FOOTBALL_API_KEY = st.secrets["FOOTBALL_API_KEY"]
 API_FOOTBALL_KEY = st.secrets.get("API_FOOTBALL_KEY", "")
+API_NINJAS_KEY = st.secrets.get("API_NINJAS_KEY", "")
 BRASILEIRAO_API_KEY = st.secrets.get("BRASILEIRAO_API_KEY", "")
 TENNIS_SCHEDULE_API_KEY = st.secrets.get("TENNIS_SCHEDULE_API_KEY", "")
 MMA_API_KEY = st.secrets.get("MMA_API_KEY", "")
@@ -678,7 +680,7 @@ def fonte_api_liga(nome_liga):
     if nome_liga == "Brasileirão Série A":
         return "rapidapi_brasileirao"
     if nome_liga in {"Liga Europa", "Conference League"}:
-        return "api_sports_football"
+        return "api_ninjas_football"
     return "football_data"
 
 
@@ -1119,7 +1121,171 @@ def buscar_resultados_brasileirao(match_ids):
     return resultados
 
 
-# API-Football / API-Sports: só para as duas competições europeias.
+# API Ninjas: jogos e resultados da Liga Europa / Conference League.
+# Identificadores textuais da API são guardados em evento_id.
+# match_id usa um identificador numérico estável por compatibilidade com Supabase.
+API_NINJAS_COMPETICOES = {
+    "Liga Europa": "uel",
+    "Conference League": "uecl",
+}
+API_NINJAS_URL = "https://api.api-ninjas.com/v1/soccermatches"
+
+
+def _match_id_ninjas(game_id):
+    # Identificador determinístico positivo de 63 bits (PostgreSQL BIGINT).
+    digest = hashlib.sha256(str(game_id).encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") & ((1 << 63) - 1)
+
+
+def _pedido_ninjas(params):
+    if not API_NINJAS_KEY:
+        return None, "Falta API_NINJAS_KEY nos Secrets do Streamlit."
+    try:
+        resposta = requests.get(
+            API_NINJAS_URL,
+            headers={"X-Api-Key": API_NINJAS_KEY},
+            params=params,
+            timeout=15,
+        )
+    except requests.RequestException:
+        return None, "Não foi possível contactar a API Ninjas."
+
+    if resposta.status_code != 200:
+        detalhe = ""
+        try:
+            dados_erro = resposta.json()
+            detalhe = str(
+                dados_erro.get("error") or dados_erro.get("message") or ""
+            ) if isinstance(dados_erro, dict) else ""
+        except ValueError:
+            pass
+        return None, (
+            f"API Ninjas: erro HTTP {resposta.status_code}"
+            + (f" — {detalhe[:200]}" if detalhe else "")
+        )
+
+    try:
+        dados = resposta.json()
+    except ValueError:
+        return None, "A API Ninjas devolveu dados inválidos."
+    if not isinstance(dados, list):
+        return None, "Formato de resposta inesperado da API Ninjas."
+    return dados, None
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def buscar_jogos_ninjas(nome_liga):
+    agora = datetime.now(TZ)
+    limite = agora + timedelta(days=45)
+    epoca = agora.year if agora.month >= 7 else agora.year - 1
+    liga = API_NINJAS_COMPETICOES[nome_liga]
+    jogos = []
+    ids_vistos = set()
+
+    # A API devolve até 50 encontros por página, ordenados pela data.
+    # Consultamos só páginas necessárias para cobrir os 45 dias.
+    for offset in range(0, 400, 50):
+        itens, erro = _pedido_ninjas({
+            "league": liga,
+            "season": epoca,
+            "status": "scheduled",
+            "offset": offset,
+        })
+        if erro:
+            return (jogos, None) if jogos else ([], erro)
+        ultrapassou_limite = False
+        for item in itens:
+            if not isinstance(item, dict):
+                continue
+            game_id = str(item.get("game_id") or "")
+            equipa_casa = item.get("home_team") or {}
+            equipa_fora = item.get("away_team") or {}
+            casa = equipa_casa.get("name") if isinstance(equipa_casa, dict) else ""
+            fora = equipa_fora.get("name") if isinstance(equipa_fora, dict) else ""
+            if not game_id or not casa or not fora or game_id in ids_vistos:
+                continue
+            if item.get("status") != "scheduled":
+                continue
+            horario = item.get("start_time")
+            if not horario:
+                continue
+            try:
+                inicio = datetime.fromisoformat(
+                    str(horario).replace("Z", "+00:00")
+                ).astimezone(TZ)
+            except (ValueError, TypeError):
+                continue
+            if inicio > limite:
+                ultrapassou_limite = True
+                continue
+            if inicio <= agora:
+                continue
+            ids_vistos.add(game_id)
+            jogos.append({
+                "match_id": _match_id_ninjas(game_id),
+                "evento_id": game_id,
+                "fonte_api": "api_ninjas_football",
+                "jogo": f"{casa} vs {fora}",
+                "casa": casa,
+                "fora": fora,
+                "liga": nome_liga,
+                "data": inicio.strftime("%d/%m/%Y %H:%M"),
+                "data_obj": inicio,
+            })
+        if len(itens) < 50 or ultrapassou_limite:
+            break
+
+    jogos.sort(key=lambda x: x["data_obj"])
+    for jogo in jogos:
+        jogo.pop("data_obj", None)
+    return jogos[:80], None
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def buscar_resultado_ninjas(game_id):
+    itens, erro = _pedido_ninjas({"game_id": str(game_id)})
+    if erro or not itens:
+        return None
+    item = next(
+        (i for i in itens if str(i.get("game_id")) == str(game_id)),
+        None,
+    )
+    if not item or item.get("status") != "final":
+        return None
+
+    periodo = item.get("period_scores") or {}
+    casa_periodos = periodo.get("home") if isinstance(periodo, dict) else None
+    fora_periodos = periodo.get("away") if isinstance(periodo, dict) else None
+    hc = casa_periodos[0] if isinstance(casa_periodos, list) and casa_periodos else None
+    hf = fora_periodos[0] if isinstance(fora_periodos, list) and fora_periodos else None
+
+    # Em jogos com prolongamento/penáltis só contam os primeiros 90 minutos.
+    if (item.get("decided_in") in ("extra_time", "penalties")):
+        if not (
+            isinstance(casa_periodos, list) and len(casa_periodos) >= 2
+            and isinstance(fora_periodos, list) and len(fora_periodos) >= 2
+        ):
+            return None
+        gc = sum(casa_periodos[:2])
+        gf = sum(fora_periodos[:2])
+    else:
+        gc = item.get("home_score")
+        gf = item.get("away_score")
+
+    if not isinstance(gc, (int, float)) or not isinstance(gf, (int, float)):
+        return None
+    gc, gf = int(gc), int(gf)
+    return {
+        "status": "FINISHED",
+        "score": {
+            "regularTime": {"home": gc, "away": gf},
+            "fullTime": {"home": gc, "away": gf},
+            "halfTime": {"home": hc, "away": hf},
+        },
+    }
+
+
+# API-Football / API-Sports: mantida para compatibilidade com registos antigos.
 API_SPORTS_COMPETICOES = {
     "Liga Europa": 3,
     "Conference League": 848,
@@ -1254,6 +1420,8 @@ def buscar_resultados_api_sports(match_ids):
 
 @st.cache_data(ttl=300, show_spinner=False)
 def buscar_jogos(nome_liga):
+    if nome_liga in API_NINJAS_COMPETICOES:
+        return buscar_jogos_ninjas(nome_liga)
     if nome_liga in API_SPORTS_COMPETICOES:
         return buscar_jogos_api_sports(nome_liga)
     if nome_liga == "Brasileirão Série A":
@@ -2565,6 +2733,7 @@ def atualizar_resultados_automaticamente():
 
     pendentes_football_data = []
     pendentes_api_sports = []
+    pendentes_ninjas = []
     pendentes_brasileirao = []
     pendentes_tenis = []
     pendentes_mma = []
@@ -2581,6 +2750,9 @@ def atualizar_resultados_automaticamente():
             # para poupar o limite mensal.
             if fonte in {"tennis_rapidapi_atp", "tennis_rapidapi_wta"} and jogo_comecou(p):
                 pendentes_tenis.append(p)
+        elif fonte == "api_ninjas_football":
+            if jogo_comecou(p):
+                pendentes_ninjas.append(p)
         elif fonte == "api_sports_football":
             if jogo_comecou(p):
                 pendentes_api_sports.append(p)
@@ -2622,7 +2794,7 @@ def atualizar_resultados_automaticamente():
     atualizados = 0
 
     # Futebol
-    for previsao in pendentes_football_data + pendentes_brasileirao + pendentes_api_sports:
+    for previsao in pendentes_football_data + pendentes_brasileirao + pendentes_api_sports + pendentes_ninjas:
         fonte = previsao.get("fonte_api")
 
         if (
@@ -2632,6 +2804,8 @@ def atualizar_resultados_automaticamente():
             partida = resultados_br.get(
                 previsao.get("match_id")
             )
+        elif fonte == "api_ninjas_football":
+            partida = buscar_resultado_ninjas(previsao.get("evento_id")) if previsao.get("evento_id") else None
         elif fonte == "api_sports_football":
             partida = resultados_as.get(previsao.get("match_id"))
         else:
@@ -4076,6 +4250,8 @@ if pagina_ativa == "⚽ Prever":
                                     st.session_state["nome"],
                                 "match_id":
                                     jogo["match_id"],
+                                "evento_id":
+                                    jogo.get("evento_id"),
                                 "fonte_api":
                                     jogo.get(
                                         "fonte_api",
