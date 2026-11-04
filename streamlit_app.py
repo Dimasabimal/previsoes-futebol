@@ -1,6 +1,5 @@
 import streamlit as st
 import requests
-import time
 import re
 import unicodedata
 from datetime import datetime, timedelta
@@ -23,7 +22,6 @@ SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
 SUPABASE_SECRET_KEY = st.secrets["SUPABASE_SECRET_KEY"]
 FOOTBALL_API_KEY = st.secrets["FOOTBALL_API_KEY"]
 BRASILEIRAO_API_KEY = st.secrets.get("BRASILEIRAO_API_KEY", "")
-TENNIS_API_KEY = st.secrets.get("TENNIS_API_KEY", "")
 TENNIS_SCHEDULE_API_KEY = st.secrets.get("TENNIS_SCHEDULE_API_KEY", "")
 MMA_API_KEY = st.secrets.get("MMA_API_KEY", "")
 UFC_API_KEY = st.secrets.get("UFC_API_KEY", "")
@@ -93,8 +91,7 @@ def parse_data_jogo(valor):
         ).replace(tzinfo=TZ)
     except Exception:
         try:
-            # A api.tennis por vezes só indica o dia, sem hora.
-            # A partir da meia-noite desse dia não são aceites novas previsões.
+            # Registos antigos podem conter só o dia, sem hora.
             return datetime.strptime(valor, "%d/%m/%Y").replace(tzinfo=TZ)
         except (ValueError, TypeError):
             return None
@@ -1598,970 +1595,239 @@ def dificuldade_previsao(
 
 
 # =========================================================
-# API DE TÉNIS
-# =========================================================
-
-
-def tennis_get(url, params=None, timeout=20):
-    """
-    Faz uma chamada GET à api.tennis com proteção contra 429.
-    - tenta uma vez
-    - se receber 429, respeita Retry-After
-    - espera pelo menos 1 segundo
-    - repete apenas uma vez
-    """
-    headers = headers_tennis()
-
-    try:
-        r = requests.get(
-            url,
-            headers=headers,
-            params=params,
-            timeout=timeout,
-        )
-    except requests.RequestException as erro:
-        return None, f"Erro de ligação à API Tennis: {erro}"
-
-    if r.status_code != 429:
-        return r, None
-
-    retry_after = r.headers.get("Retry-After")
-
-    try:
-        espera = float(retry_after) if retry_after else 1.2
-    except Exception:
-        espera = 1.2
-
-    espera = max(1.0, min(espera, 5.0))
-    time.sleep(espera)
-
-    try:
-        r2 = requests.get(
-            url,
-            headers=headers,
-            params=params,
-            timeout=timeout,
-        )
-    except requests.RequestException as erro:
-        return None, f"Erro de ligação à API Tennis: {erro}"
-
-    if r2.status_code == 429:
-        return r2, (
-            "A API Tennis está a limitar pedidos por segundo. "
-            "Espera alguns segundos e tenta novamente."
-        )
-
-    return r2, None
-
-
-TENNIS_API_BASE = "https://api.tennis/v1"
-
-
-def headers_tennis():
-    # O dashboard atual da api.tennis mostra X-API-Key.
-    # Também enviamos Bearer para manter compatibilidade com a
-    # documentação pública mais recente.
-    return {
-        "X-API-Key": TENNIS_API_KEY,
-        "Authorization": f"Bearer {TENNIS_API_KEY}",
-        "Accept": "application/json",
-    }
-
-
-def _lista_tennis(dados):
-    if isinstance(dados, list):
-        return dados
-
-    if isinstance(dados, dict):
-        for chave in [
-            "matches",
-            "data",
-            "results",
-            "response",
-            "items",
-            "events",
-        ]:
-            valor = dados.get(chave)
-
-            if isinstance(valor, list):
-                return valor
-
-            # Alguns serviços embrulham a lista dentro de data/results.
-            if isinstance(valor, dict):
-                for subchave in [
-                    "matches",
-                    "items",
-                    "results",
-                    "events",
-                    "data",
-                ]:
-                    subvalor = valor.get(subchave)
-                    if isinstance(subvalor, list):
-                        return subvalor
-
-        # Alguns endpoints devolvem um único encontro.
-        if any(
-            chave in dados
-            for chave in [
-                "match_id",
-                "id",
-                "players",
-                "player1",
-                "event_id",
-            ]
-        ):
-            return [dados]
-
-    return []
-
-
-def _nome_torneio_tennis(item):
-    torneio = item.get("tournament")
-
-    if isinstance(torneio, dict):
-        nome = (
-            torneio.get("name")
-            or torneio.get("title")
-        )
-        if nome:
-            return str(nome)
-
-    if torneio:
-        return str(torneio)
-
-    edicao = item.get("edition")
-    if isinstance(edicao, dict):
-        nome = edicao.get("name")
-        if nome:
-            return str(nome)
-
-    return "Torneio"
-
-
-def _players_tennis(item):
-    # Formato real da api.tennis:
-    # "sides": [
-    #   {"side": 1, "players": [{"id": ..., "name": ...}]},
-    #   {"side": 2, "players": [{"id": ..., "name": ...}]}
-    # ]
-    sides = item.get("sides")
-
-    if isinstance(sides, list) and len(sides) >= 2:
-        lados = {}
-
-        for lado in sides:
-            if not isinstance(lado, dict):
-                continue
-
-            numero = lado.get("side")
-            jogadores = lado.get("players") or []
-
-            jogador = None
-
-            # Singles: normalmente há apenas 1 jogador por lado.
-            if isinstance(jogadores, list) and jogadores:
-                candidato = jogadores[0]
-                if isinstance(candidato, dict):
-                    jogador = dict(candidato)
-                elif candidato:
-                    jogador = {"name": str(candidato)}
-
-            # Alguns registos podem trazer equipa/entry em vez de player.
-            if jogador is None:
-                equipa = lado.get("team")
-                if isinstance(equipa, dict):
-                    jogador = dict(equipa)
-                elif equipa:
-                    jogador = {"name": str(equipa)}
-
-            if jogador is not None:
-                jogador["_side"] = numero
-                jogador["_winner"] = bool(lado.get("winner"))
-                lados[numero] = jogador
-
-        if 1 in lados and 2 in lados:
-            return lados[1], lados[2]
-
-    # Fallback para outros formatos possíveis.
-    jogadores = item.get("players")
-
-    if isinstance(jogadores, list) and len(jogadores) >= 2:
-        p1 = jogadores[0]
-        p2 = jogadores[1]
-
-        if not isinstance(p1, dict):
-            p1 = {"name": str(p1)}
-        if not isinstance(p2, dict):
-            p2 = {"name": str(p2)}
-
-        return p1, p2
-
-    p1 = (
-        item.get("player1")
-        or item.get("home")
-        or item.get("first_player")
-    )
-    p2 = (
-        item.get("player2")
-        or item.get("away")
-        or item.get("second_player")
-    )
-
-    if p1 and p2:
-        if not isinstance(p1, dict):
-            p1 = {"name": str(p1)}
-        if not isinstance(p2, dict):
-            p2 = {"name": str(p2)}
-        return p1, p2
-
-    return None, None
-
-
-def _rank_tennis(player):
-    if not isinstance(player, dict):
-        return None
-
-    for chave in ["rank", "ranking", "position"]:
-        valor = player.get(chave)
-        if isinstance(valor, dict):
-            valor = valor.get("position") or valor.get("rank")
-        try:
-            if valor is not None:
-                return int(valor)
-        except Exception:
-            pass
-
-    return None
-
-
-def _parse_data_tennis(item):
-    candidatos = [
-        item.get("start_time"),
-        item.get("scheduled_at"),
-        item.get("scheduled"),
-        item.get("start_at"),
-        item.get("datetime"),
-        item.get("start"),
-        item.get("start_date"),
-        item.get("event_date"),
-        item.get("date"),
-        item.get("timestamp"),
-        item.get("start_timestamp"),
-    ]
-
-    for valor in candidatos:
-        if valor is None or valor == "":
-            continue
-
-        # Unix timestamp em segundos ou milissegundos.
-        if isinstance(valor, (int, float)):
-            try:
-                numero = float(valor)
-                if numero > 10_000_000_000:
-                    numero /= 1000
-                return datetime.fromtimestamp(
-                    numero,
-                    tz=ZoneInfo("UTC"),
-                ).astimezone(TZ)
-            except Exception:
-                pass
-
-        # Data isolada + hora isolada.
-        if (
-            isinstance(valor, str)
-            and len(valor) == 10
-            and (
-                item.get("time")
-                or item.get("event_time")
-                or item.get("start_time_local")
-            )
-        ):
-            hora = (
-                item.get("time")
-                or item.get("event_time")
-                or item.get("start_time_local")
-            )
-            valor = f"{valor}T{hora}"
-
-        try:
-            valor_str = str(valor)
-
-            # Quando a API devolve apenas YYYY-MM-DD,
-            # não há hora exata. Usamos 12:00 para evitar
-            # eliminar jogos de hoje por estarem a "00:00".
-            if (
-                len(valor_str) == 10
-                and valor_str[4] == "-"
-                and valor_str[7] == "-"
-            ):
-                dt = datetime.fromisoformat(
-                    valor_str + "T12:00:00"
-                ).replace(tzinfo=TZ)
-            else:
-                dt = datetime.fromisoformat(
-                    valor_str.replace("Z", "+00:00")
-                )
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=TZ)
-
-            return dt.astimezone(TZ)
-        except Exception:
-            pass
-
-        for formato in [
-            "%Y-%m-%d %H:%M:%S",
-            "%Y-%m-%d %H:%M",
-            "%Y-%m-%dT%H:%M:%S",
-            "%Y-%m-%dT%H:%M",
-            "%d/%m/%Y %H:%M",
-        ]:
-            try:
-                return datetime.strptime(
-                    str(valor),
-                    formato,
-                ).replace(tzinfo=TZ)
-            except Exception:
-                pass
-
-    return None
-
-
-def _tour_tennis(item):
-    circuito = str(item.get("circuit") or "").strip().lower()
-
-    # Valores reais observados na api.tennis.
-    if circuito in {"atp", "challenger"}:
-        return "ATP"
-
-    if circuito == "wta":
-        return "WTA"
-
-    # ITF/Fed/Davis/etc. não entram quando o utilizador escolhe ATP/WTA.
-    if circuito in {
-        "itf",
-        "fed",
-        "davis",
-        "utr",
-        "exhibition",
-    }:
-        return circuito.upper()
-
-    valores = [
-        item.get("category"),
-        item.get("gender"),
-        item.get("event_type"),
-        item.get("level_name"),
-    ]
-
-    torneio = item.get("tournament")
-    if isinstance(torneio, dict):
-        valores.extend([
-            torneio.get("name"),
-            torneio.get("category"),
-            torneio.get("gender"),
-        ])
-
-    texto = " ".join(
-        str(v) for v in valores if v
-    ).lower()
-
-    if "wta" in texto or "women" in texto or "female" in texto:
-        return "WTA"
-
-    if (
-        "atp" in texto
-        or "challenger" in texto
-        or "men" in texto
-        or "male" in texto
-    ):
-        return "ATP"
-
-    return None
-
-
-def _status_tennis(item):
-    status = item.get("status")
-    if isinstance(status, dict):
-        status = (
-            status.get("name")
-            or status.get("short")
-            or status.get("status")
-        )
-    return str(status or "").strip().lower()
-
-
-def hora_confirmada_tenis(evento_id, data_original):
-    """Hora individual confirmada manualmente com a ordem de jogos.
-
-    Opcional nos Secrets do Streamlit (hora de Portugal continental):
-
-    [TENNIS_HORARIOS]
-    "123456" = "2026-11-04 14:30"
-
-    Nunca usar horários gerais da sessão como hora de um encontro.
-    """
-    try:
-        configuracao = st.secrets.get("TENNIS_HORARIOS", {})
-        texto = configuracao.get(str(evento_id))
-    except (KeyError, AttributeError, TypeError):
-        return None
-
-    if not texto:
-        return None
-
-    try:
-        confirmado = datetime.strptime(
-            str(texto).strip(), "%Y-%m-%d %H:%M"
-        ).replace(tzinfo=TZ)
-        if confirmado.date() != data_original.date():
-            return None
-        return confirmado
-    except (ValueError, TypeError):
-        return None
-
-
-# =========================================================
-# HORÁRIOS COMPLEMENTARES: Tennis API / RapidAPI
+# TÉNIS — UMA ÚNICA FONTE (RAPIDAPI TENNIS API)
 # =========================================================
 
 TENNIS_SCHEDULE_HOST = "tennis-api-atp-wta-itf.p.rapidapi.com"
+TENNIS_RAPID_BASE = f"https://{TENNIS_SCHEDULE_HOST}/tennis/v2"
 
 
 def _normalizar_nome_tenis(valor):
-    texto = unicodedata.normalize("NFKD", str(valor or "").casefold())
-    texto = "".join(c for c in texto if not unicodedata.combining(c))
-    return re.sub(r"[^a-z0-9]", "", texto)
+    txt = unicodedata.normalize("NFKD", str(valor or "").casefold())
+    txt = "".join(c for c in txt if not unicodedata.combining(c))
+    return re.sub(r"[^a-z0-9]", "", txt)
 
 
-def _mesma_competicao_tenis(a, b):
-    # Sem confirmação de torneio, não misturar confrontos semelhantes.
-    aa = _normalizar_nome_tenis(a)
-    bb = _normalizar_nome_tenis(b)
-    return bool(aa and bb and (aa in bb or bb in aa))
-
-
-@st.cache_data(ttl=21600, show_spinner=False)
-def consultar_horarios_complementares(circuito):
-    """Procura ATP/WTA principais sem consumir a quota com ITF nas primeiras páginas."""
-    diagnostico = {
-        "chave_no_streamlit": bool(TENNIS_SCHEDULE_API_KEY),
-        "circuito": circuito, "pedidos": [],
-        "encontros_interpretados": 0, "amostras": [],
-        "filtro": "torneios principais e Paris Masters",
-    }
-    if not TENNIS_SCHEDULE_API_KEY:
-        return [], "Chave do calendário não configurada nos Secrets.", diagnostico
-
-    url = (f"https://{TENNIS_SCHEDULE_HOST}"
-           f"/tennis/v2/upcoming/matches/{circuito.lower()}")
-    headers = {
+def _cabecalhos_tenis_rapidapi():
+    return {
         "X-RapidAPI-Key": TENNIS_SCHEDULE_API_KEY,
         "X-RapidAPI-Host": TENNIS_SCHEDULE_HOST,
         "Accept": "application/json",
     }
+
+
+def _pedido_tenis_rapidapi(caminho, parametros=None):
+    if not TENNIS_SCHEDULE_API_KEY:
+        return None, "Falta TENNIS_SCHEDULE_API_KEY nos Secrets."
+    try:
+        resposta = requests.get(
+            f"{TENNIS_RAPID_BASE}{caminho}",
+            headers=_cabecalhos_tenis_rapidapi(),
+            params=parametros or {},
+            timeout=20,
+        )
+    except requests.RequestException:
+        return None, "Não foi possível contactar a API de ténis."
+    if resposta.status_code != 200:
+        return None, f"Tennis API: HTTP {resposta.status_code}."
+    try:
+        return resposta.json(), None
+    except (ValueError, TypeError):
+        return None, "A API devolveu dados inválidos."
+
+
+def _dados_tenis_resposta(dados):
+    if isinstance(dados, dict):
+        item = dados.get("data")
+        return item if isinstance(item, dict) else dados
+    return {}
+
+
+def _dt_tenis_rapidapi(valor):
+    if not valor:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(valor).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            return None
+        return dt.astimezone(TZ)
+    except (ValueError, TypeError):
+        return None
+
+
+def _ranking_jogador_tenis(item):
+    # A API pode omitir rankings nos encontros futuros.
+    valor = item.get("rank") or item.get("ranking")
+    if isinstance(valor, dict):
+        valor = valor.get("rank") or valor.get("position")
+    try:
+        numero = int(valor)
+        return numero if numero > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+@st.cache_data(ttl=7200, show_spinner=False)
+def buscar_jogos_tenis(circuito):
+    """Obtém ATP/WTA apenas da Tennis API; não cruza fornecedores."""
+    diag = {"fonte": "Tennis API (RapidAPI)", "circuito": circuito,
+            "chave_configurada": bool(TENNIS_SCHEDULE_API_KEY),
+            "pedidos": [], "encontros_disponiveis": 0}
+    if not TENNIS_SCHEDULE_API_KEY:
+        return [], "Falta TENNIS_SCHEDULE_API_KEY nos Secrets.", diag
+
+    tour = "atp" if circuito.upper() == "ATP" else "wta"
     hoje = datetime.now(TZ).date()
     base = {
         "group": "singles",
-        "dateFrom": (hoje - timedelta(days=1)).isoformat(),
-        "dateTo": (hoje + timedelta(days=8)).isoformat(),
+        "dateFrom": hoje.isoformat(),
+        "dateTo": (hoje + timedelta(days=10)).isoformat(),
+        "rank": "2,3,4,7",  # Tour, Masters, Grand Slam e finais
+        "sortBy": "startTime",
         "limit": 100,
         "page": 1,
         "include": "fixtureDetails,metadata",
     }
-    # O dataset atp inclui também ITF/Challenger. Um filtro de rank
-    # limita a pesquisa aos níveis principais; a pesquisa específica
-    # por Paris evita que o Masters se perca entre dezenas de torneios.
-    consultas = [
-        ("torneios principais", {**base, "rank": "2,3"}),
-    ]
-    if circuito.upper() == "ATP":
-        consultas.insert(0, (
-            "Paris Masters", {**base, "tournament": "Paris"}
-        ))
+    pesquisas = []
+    if tour == "atp":
+        pesquisas.append(("Paris Masters", {**base, "tournament": "Paris"}))
+    pesquisas.append(("Torneios principais", base))
 
-    resultados = []
-    ids_vistos = set()
-    falhas = []
-    for descricao, parametros in consultas:
-        try:
-            resposta = requests.get(
-                url, headers=headers, params=parametros, timeout=20
-            )
-        except requests.RequestException:
-            falhas.append(f"{descricao}: ligação indisponível")
+    vistos = set()
+    jogos = []
+    erros = []
+    for descricao, params in pesquisas:
+        payload, erro = _pedido_tenis_rapidapi(
+            f"/upcoming/matches/{tour}", params
+        )
+        if erro:
+            diag["pedidos"].append({"pesquisa": descricao, "erro": erro})
+            erros.append(erro)
             continue
-        reg = {"pesquisa": descricao, "http": resposta.status_code}
-        diagnostico["pedidos"].append(reg)
-        if resposta.status_code != 200:
-            falhas.append(f"{descricao}: HTTP {resposta.status_code}")
-            continue
-        try:
-            corpo = resposta.json()
-        except (ValueError, TypeError):
-            falhas.append(f"{descricao}: JSON inválido")
-            continue
-        lista = corpo.get("matches") or [] if isinstance(corpo, dict) else []
-        reg["encontros_devolvidos"] = len(lista) if isinstance(lista, list) else 0
-        reg["total_api"] = corpo.get("total") if isinstance(corpo, dict) else None
-        reg["mais_paginas"] = corpo.get("hasNextPage") if isinstance(corpo, dict) else None
+        lista = payload.get("matches", []) if isinstance(payload, dict) else []
         if not isinstance(lista, list):
-            continue
+            lista = []
+        diag["pedidos"].append({"pesquisa": descricao,
+                                "recebidos": len(lista),
+                                "total_api": payload.get("total")})
         for item in lista:
             if not isinstance(item, dict):
                 continue
-            p1 = item.get("player1") or {}
-            p2 = item.get("player2") or {}
+            if item.get("doubles") is True or item.get("awaitingParticipants") or item.get("isBye"):
+                continue
+            p1, p2 = item.get("player1") or {}, item.get("player2") or {}
+            if not isinstance(p1, dict) or not isinstance(p2, dict):
+                continue
+            nome1, nome2 = p1.get("name"), p2.get("name")
+            id1, id2 = p1.get("id"), p2.get("id")
             torneio = item.get("tournament") or {}
-            data_iso = item.get("startTime") or item.get("start_time") or item.get("date")
-            nome1 = (p1.get("name") or p1.get("fullName")) if isinstance(p1, dict) else None
-            nome2 = (p2.get("name") or p2.get("fullName")) if isinstance(p2, dict) else None
-            nome_torneio = torneio.get("name") if isinstance(torneio, dict) else str(torneio)
-            if len(diagnostico["amostras"]) < 5:
-                diagnostico["amostras"].append({
-                    "pesquisa": descricao, "jogador1": nome1,
-                    "jogador2": nome2, "torneio": nome_torneio,
-                    "horario": str(data_iso)[:35],
-                })
-            if not nome1 or not nome2 or not data_iso:
+            if not isinstance(torneio, dict):
                 continue
+            nome_torneio = torneio.get("name") or "ATP/WTA"
+            rank = torneio.get("rankId")
             try:
-                dt = datetime.fromisoformat(str(data_iso).replace("Z", "+00:00"))
-                if dt.tzinfo is None:
-                    continue
-                dt = dt.astimezone(TZ)
+                rank = int(rank)
             except (TypeError, ValueError):
+                rank = None
+            if rank is not None and rank not in (2, 3, 4, 7):
                 continue
-            identificador = str(item.get("matchId") or item.get("id") or "")
-            identificador_unico = identificador or (
-                _normalizar_nome_tenis(nome1),
-                _normalizar_nome_tenis(nome2), dt.isoformat()
-            )
-            if identificador_unico in ids_vistos:
+            inicio = _dt_tenis_rapidapi(item.get("startTime") or item.get("date"))
+            if inicio is None or not nome1 or not nome2 or not id1 or not id2:
                 continue
-            ids_vistos.add(identificador_unico)
-            resultados.append({
-                "nomes": frozenset({
-                    _normalizar_nome_tenis(nome1),
-                    _normalizar_nome_tenis(nome2),
-                }),
-                "jogador1": nome1,
-                "jogador2": nome2,
-                "chave_unica": str(identificador_unico),
-                "torneio": nome_torneio or "",
-                "data": dt,
-                "origem": str(item.get("startTimeSource") or "").lower(),
-                "id_suplementar": identificador,
+            if inicio.date() < hoje or inicio.date() > hoje + timedelta(days=10):
+                continue
+            event_id = item.get("liveMatchId")
+            if not event_id:
+                # Sem ID duradouro não é possível corrigir depois sem ambiguidades.
+                continue
+            event_id = str(event_id)
+            if event_id in vistos:
+                continue
+            vistos.add(event_id)
+            fonte_hora = str(item.get("startTimeSource") or "schedule").lower()
+            jogos.append({
+                "evento_id": event_id,
+                "jogo": f"{nome1} vs {nome2}",
+                "casa": nome1, "fora": nome2,
+                "liga": nome_torneio,
+                "data": inicio.strftime("%d/%m/%Y %H:%M"),
+                "data_obj": inicio,
+                "fonte_api": "tennis_rapidapi_wta" if circuito == "WTA" else "tennis_rapidapi_atp",
+                "modalidade": "Ténis",
+                "hora_confirmada": True,
+                "horario_previsto": True,
+                "origem_horario": fonte_hora,
+                "estado_api": "scheduled",
+                "circuito": circuito,
+                "rank_casa": _ranking_jogador_tenis(p1),
+                "rank_fora": _ranking_jogador_tenis(p2),
             })
-    diagnostico["encontros_interpretados"] = len(resultados)
-    erro = "; ".join(falhas) if falhas and not resultados else None
-    return resultados, erro, diagnostico
-
-
-def _partes_nome_tenis(nome):
-    """Separa nomes sem acentos, preservando iniciais e apelido final."""
-    base = unicodedata.normalize("NFKD", str(nome or "").casefold())
-    base = "".join(c for c in base if not unicodedata.combining(c))
-    return re.findall(r"[a-z]+", base)
-
-
-def _jogador_equivalente_tenis(a, b):
-    """Correspondência conservadora: apelido + primeiro nome/inicial."""
-    if _normalizar_nome_tenis(a) == _normalizar_nome_tenis(b):
-        return bool(_normalizar_nome_tenis(a))
-    pa, pb = _partes_nome_tenis(a), _partes_nome_tenis(b)
-    if len(pa) < 2 or len(pb) < 2:
-        return False
-    # Evita trocar pessoas que partilham apelido.
-    if pa[-1] != pb[-1] or pa[0][0] != pb[0][0]:
-        return False
-    # Se ambos têm primeiro nome escrito por extenso, exigir igualdade.
-    if len(pa[0]) > 1 and len(pb[0]) > 1 and pa[0] != pb[0]:
-        return False
-    return True
-
-
-def _mesmos_jogadores_tenis(jogo, calendario):
-    a, b = jogo.get("casa"), jogo.get("fora")
-    c, e = calendario.get("jogador1"), calendario.get("jogador2")
-    return (
-        (_jogador_equivalente_tenis(a, c) and _jogador_equivalente_tenis(b, e))
-        or (_jogador_equivalente_tenis(a, e) and _jogador_equivalente_tenis(b, c))
-    )
-
-
-def completar_horarios_tenis(jogos, circuito):
-    diagnostico = {
-        "chave_no_streamlit": bool(TENNIS_SCHEDULE_API_KEY),
-        "encontros_originais": len(jogos),
-        "correspondencias": 0,
-    }
-    if not jogos:
-        return jogos, None, diagnostico
-
-    programacao, erro, diagnostico_api = consultar_horarios_complementares(circuito)
-    diagnostico.update(diagnostico_api)
-    if erro:
-        return jogos, erro, diagnostico
-
-    # Um jogo complementar não pode ser atribuído a dois jogos originais.
-    usados = set()
-    motivos = {"sem_jogadores_equivalentes": 0,
-               "torneio_diferente": 0,
-               "data_demasiado_distante": 0,
-               "correspondencia_ambigua": 0}
-    exemplos_sem_correspondencia = []
-    exemplos_corrigidos = []
-
-    for jogo in jogos:
-        dt_antiga = parse_data_jogo(jogo.get("data"))
-        if dt_antiga is None:
-            continue
-
-        pares = [c for c in programacao if _mesmos_jogadores_tenis(jogo, c)]
-        mesma_competicao = [c for c in pares if _mesma_competicao_tenis(
-            jogo.get("liga"), c.get("torneio"))]
-        candidatos = [c for c in mesma_competicao
-                      if abs((c["data"].date() - dt_antiga.date()).days) <= 3
-                      and c["chave_unica"] not in usados]
-        if not pares:
-            motivo = "sem_jogadores_equivalentes"
-        elif not mesma_competicao:
-            motivo = "torneio_diferente"
-        elif not candidatos:
-            motivo = "data_demasiado_distante"
-        elif len(candidatos) != 1:
-            motivo = "correspondencia_ambigua"
-        else:
-            motivo = None
-
-        if motivo:
-            motivos[motivo] += 1
-            if len(exemplos_sem_correspondencia) < 8:
-                exemplos_sem_correspondencia.append({
-                    "jogo": jogo.get("jogo"),
-                    "torneio": jogo.get("liga"),
-                    "motivo": motivo,
-                })
-            continue
-
-        candidato = candidatos[0]
-        usados.add(candidato["chave_unica"])
-        dt = candidato["data"]
-        data_anterior = jogo["data"]
-        jogo["data"] = dt.strftime("%d/%m/%Y %H:%M")
-        jogo["data_corrigida"] = True
-        # A hora é prevista, NÃO é prova de que o jogo ainda não começou.
-        # No próprio dia exige-se confirmação independente do estado ao vivo.
-        jogo["hora_confirmada"] = False
-        jogo["horario_previsto"] = True
-        jogo["origem_horario"] = candidato["origem"] or "calendário"
-        jogo["id_suplementar"] = candidato["id_suplementar"]
-        diagnostico["correspondencias"] += 1
-        if len(exemplos_corrigidos) < 8:
-            exemplos_corrigidos.append({
-                "jogo": jogo.get("jogo"), "antes": data_anterior,
-                "depois": jogo["data"],
-            })
-
-    diagnostico["motivos_sem_correspondencia"] = motivos
-    diagnostico["exemplos_sem_correspondencia"] = exemplos_sem_correspondencia
-    diagnostico["exemplos_corrigidos"] = exemplos_corrigidos
-    jogos.sort(key=lambda x: parse_data_jogo(x.get("data")) or datetime.max.replace(tzinfo=TZ))
-    return jogos, None, diagnostico
+    jogos.sort(key=lambda j: j["data_obj"])
+    for j in jogos:
+        j.pop("data_obj", None)
+    diag["encontros_disponiveis"] = len(jogos)
+    if not jogos and erros:
+        return [], "; ".join(dict.fromkeys(erros)), diag
+    return jogos[:100], None, diag
 
 
 def estado_previsao_tenis(jogo):
-    """(aberto, motivo). Falha pelo lado seguro quando falta hora no dia."""
-    agora = datetime.now(TZ)
+    """Nunca assume que hora prevista garante que o encontro não começou."""
     dt = parse_data_jogo(jogo.get("data"))
     if dt is None:
-        return False, "Data do encontro desconhecida."
-    if jogo.get("estado_api") in {
-        "completed", "finished", "final", "retired", "walkover",
-        "defaulted", "abandoned", "cancelled", "canceled", "ended",
-        "live", "in_progress", "playing", "in progress", "ongoing",
-    }:
-        return False, "O encontro já começou ou terminou."
-    if not jogo.get("hora_confirmada"):
-        if agora.date() >= dt.date():
-            return False, "Sem confirmação de que ainda não começou hoje; previsões bloqueadas por segurança."
-        return True, "Encontro futuro: previsões abertas até à véspera; horário sujeito a alteração."
-    if agora >= dt:
-        return False, "A hora prevista do encontro já foi atingida."
-    return True, "Horário individual confirmado."
-
-
-@st.cache_data(ttl=900, show_spinner=False)
-def buscar_jogos_tenis(circuito):
-    """Consulta cada circuito e devolve um diagnóstico sem revelar tokens."""
-    if not TENNIS_API_KEY:
-        return [], "TENNIS_API_KEY não configurada.", {}
-
+        return False, "Horário desconhecido."
     agora = datetime.now(TZ)
-    inicio = agora.date()
-    fim = inicio + timedelta(days=7)
-    url = f"{TENNIS_API_BASE}/matches"
-    circuitos = {"atp", "ch"} if circuito == "ATP" else {"wta"}
-    pesquisas = ["atp", "ch"] if circuito == "ATP" else ["wta"]
-    itens = []
-    erros = []
-    diagnostico = {"intervalo": f"{inicio} a {fim}", "pedidos": [], "excluidos": {}, "amostras": []}
-
-    for codigo in pesquisas:
-        params = {
-            "from": inicio.isoformat(),
-            "to": fim.isoformat(),
-            "circuit": codigo,
-            "doubles": "false",
-            "limit": 100,
-        }
-        r, erro = tennis_get(url, params=params, timeout=20)
-        pedido = {"circuito": codigo}
-        if erro:
-            pedido["erro"] = str(erro)[:150]
-            erros.append(erro)
-        elif r is None:
-            pedido["erro"] = "Sem resposta"
-            erros.append("Sem resposta da API")
-        else:
-            pedido["http"] = r.status_code
-            if r.status_code != 200:
-                erros.append(f"API Tennis: HTTP {r.status_code}")
-            else:
-                try:
-                    dados = r.json()
-                    lista = _lista_tennis(dados)
-                    pedido["total"] = len(lista)
-                    if isinstance(dados, dict):
-                        meta = dados.get("meta") or {}
-                        if isinstance(meta, dict):
-                            pedido["meta_count"] = meta.get("count")
-                            pedido["tem_proxima_pagina"] = bool(meta.get("next_cursor"))
-                    itens.extend(lista)
-                except ValueError:
-                    erros.append("Resposta da API inválida")
-                    pedido["erro"] = "JSON inválido"
-        diagnostico["pedidos"].append(pedido)
-
-    excluidos = {"circuito":0, "terminado_ou_duplas":0, "data_invalida":0,
-                 "hoje_sem_hora_ou_iniciado":0, "jogadores_ausentes":0,
-                 "id_ausente_ou_repetido":0}
-    vistos = set()
-    jogos = []
-    terminados = {"completed","finished","final","retired","walkover",
-                  "defaulted","abandoned","cancelled","canceled","ended"}
-    for item in itens:
-        if not isinstance(item, dict):
-            continue
-        if len(diagnostico["amostras"]) < 5:
-            diagnostico["amostras"].append({
-                "data": item.get("date"),
-                "circuito": item.get("circuit"),
-                "estado": item.get("status"),
-                "torneio": _nome_torneio_tennis(item),
-                "lados": len(item.get("sides") or []),
-            })
-        if str(item.get("circuit") or "").strip().lower() not in circuitos:
-            excluidos["circuito"] += 1
-            continue
-        if item.get("doubles") is True or _status_tennis(item) in terminados:
-            excluidos["terminado_ou_duplas"] += 1
-            continue
-        dt = _parse_data_tennis(item)
-        if dt is None or dt.date() < inicio or dt.date() > fim:
-            excluidos["data_invalida"] += 1
-            continue
-        tem_hora = any(item.get(k) for k in (
-            "start_time", "scheduled_at", "scheduled", "start_at", "datetime",
-            "start", "start_timestamp", "timestamp", "time", "event_time", "start_time_local"))
-        # Manter encontros de hoje na lista, mesmo sem hora exata.
-        # O bloqueio é feito na interface e também ao guardar.
-        # Não usar 12:00 inventado como horário de início.
-        p1, p2 = _players_tennis(item)
-        nome1 = (p1 or {}).get("name") or (p1 or {}).get("full_name") or (p1 or {}).get("player_name")
-        nome2 = (p2 or {}).get("name") or (p2 or {}).get("full_name") or (p2 or {}).get("player_name")
-        if not nome1 or not nome2:
-            excluidos["jogadores_ausentes"] += 1
-            continue
-        eid = item.get("id") or item.get("match_id") or item.get("event_id") or item.get("key")
-        if eid is None or str(eid) in vistos:
-            excluidos["id_ausente_ou_repetido"] += 1
-            continue
-        vistos.add(str(eid))
-        horario_adicional = None
-        if not tem_hora:
-            horario_adicional = hora_confirmada_tenis(eid, dt)
-        horario_final = horario_adicional or dt
-        tem_hora_real = bool(tem_hora or horario_adicional)
-        jogos.append({
-            "evento_id": str(eid), "jogo": f"{nome1} vs {nome2}",
-            "casa": nome1, "fora": nome2,
-            "liga": _nome_torneio_tennis(item),
-            "data": horario_final.strftime("%d/%m/%Y %H:%M") if tem_hora_real else dt.strftime("%d/%m/%Y"),
-            "data_obj": horario_final, "fonte_api": "api_tennis", "modalidade": "Ténis",
-            "hora_confirmada": tem_hora_real,
-            "estado_api": _status_tennis(item),
-            "circuito": circuito, "rank_casa": _rank_tennis(p1), "rank_fora": _rank_tennis(p2),
-        })
-    jogos.sort(key=lambda j: (0 if circuito == "ATP" and "challenger" not in j["liga"].lower() else 1, j["data_obj"]))
-    for jogo in jogos:
-        jogo.pop("data_obj", None)
-    diagnostico["total_recebido"] = len(itens)
-    diagnostico["total_disponivel"] = len(jogos)
-    diagnostico["excluidos"] = excluidos
-    if not jogos and erros:
-        return [], "; ".join(dict.fromkeys(erros)), diagnostico
-    return jogos[:100], None, diagnostico
+    if jogo.get("estado_api") in {"live", "inplay", "ended", "finished", "completed"}:
+        return False, "O encontro já começou ou terminou."
+    # Reserva de 1h, pois horários de ténis podem ser antecipados.
+    if agora >= dt - timedelta(hours=1):
+        return False, "Previsões fechadas por segurança antes da hora prevista."
+    return True, "Horário previsto pela Tennis API; pode sofrer alterações."
 
 
 def dificuldade_tenis(jogo, valor):
-    rank1 = jogo.get("rank_casa")
-    rank2 = jogo.get("rank_fora")
-
+    rank1, rank2 = jogo.get("rank_casa"), jogo.get("rank_fora")
     if rank1 is None or rank2 is None:
         return "Média", 1.5
-
     escolhido = rank1 if valor == "Jogador1" else rank2
     adversario = rank2 if valor == "Jogador1" else rank1
-
-    # Ranking menor = jogador mais bem classificado.
-    if escolhido <= max(10, adversario * 0.50):
+    if escolhido <= max(10, adversario * .5):
         return "Fácil", 1.0
-
     if escolhido <= adversario * 1.15:
         return "Média", 1.5
-
-    if escolhido <= adversario * 2.0:
+    if escolhido <= adversario * 2:
         return "Difícil", 2.0
-
     return "Muito difícil", 3.0
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def buscar_resultado_tenis(evento_id):
-    if not TENNIS_API_KEY or not evento_id:
+@st.cache_data(ttl=7200, show_spinner=False)
+def buscar_resultado_tenis(evento_id, circuito="ATP", nome1="", nome2=""):
+    """Usa o ID estável do mesmo fornecedor. Nunca assume vencedor por posição
+    enquanto o jogo não constar no arquivo de resultados completos."""
+    if not evento_id or not TENNIS_SCHEDULE_API_KEY:
         return None
-
-    url = f"{TENNIS_API_BASE}/matches/{evento_id}"
-
-    r, erro_rate = tennis_get(
-        url,
-        timeout=20,
+    tour = "wta" if str(circuito).upper() == "WTA" else "atp"
+    payload, erro = _pedido_tenis_rapidapi(
+        f"/matches/{evento_id}", {"type": tour, "source": "game"}
     )
-
-    if erro_rate or r is None:
+    if erro or not payload:
         return None
-
-    if r.status_code != 200:
-        return None
-
-    try:
-        dados = r.json()
-    except Exception:
-        return None
-
-    lista = _lista_tennis(dados)
-    if not lista:
-        return None
-
-    item = lista[0]
-    status = _status_tennis(item)
-
-    terminado = status in {
-        "finished",
-        "final",
-        "completed",
-        "complete",
-        "retired",
-        "walkover",
-        "ended",
-        "closed",
-    }
-
-    if not terminado:
+    item = _dados_tenis_resposta(payload)
+    if item.get("source") != "game" or not item.get("result"):
         return {"status": "PENDING"}
-
-    p1, p2 = _players_tennis(item)
-    if not p1 or not p2:
+    vencedor = item.get("player1") or {}
+    perdedor = item.get("player2") or {}
+    if not isinstance(vencedor, dict) or not isinstance(perdedor, dict):
         return None
-
-    nome1 = (
-        p1.get("name")
-        or p1.get("full_name")
-        or p1.get("player_name")
-    )
-    nome2 = (
-        p2.get("name")
-        or p2.get("full_name")
-        or p2.get("player_name")
-    )
-
-    vencedor_indice = None
-
-    # Campo real observado na resposta.
-    winner_side = item.get("winner_side")
-    try:
-        if winner_side is not None:
-            vencedor_indice = int(winner_side) - 1
-    except Exception:
-        pass
-
-    # Fallback pelo campo winner dentro de sides.
-    if vencedor_indice is None:
-        if p1.get("_winner") is True:
-            vencedor_indice = 0
-        elif p2.get("_winner") is True:
-            vencedor_indice = 1
-
-    if vencedor_indice not in [0, 1]:
+    nome_vencedor = vencedor.get("name") or ""
+    nome_perdedor = perdedor.get("name") or ""
+    nomes_registados = {_normalizar_nome_tenis(nome1), _normalizar_nome_tenis(nome2)}
+    nomes_api = {_normalizar_nome_tenis(nome_vencedor), _normalizar_nome_tenis(nome_perdedor)}
+    if not all(nomes_registados) or nomes_api != nomes_registados:
         return None
-
-    placar = ""
-
-    score = item.get("score")
-    if score is not None:
-        if isinstance(score, str):
-            placar = score
-        elif isinstance(score, (dict, list)):
-            placar = str(score)
-
-    if not placar:
-        sets = item.get("sets")
-        if isinstance(sets, list):
-            partes = []
-            for parcial in sets:
-                if isinstance(parcial, dict):
-                    a = (
-                        parcial.get("side1")
-                        or parcial.get("player1")
-                        or parcial.get("home")
-                    )
-                    b = (
-                        parcial.get("side2")
-                        or parcial.get("player2")
-                        or parcial.get("away")
-                    )
-                    if a is not None and b is not None:
-                        partes.append(f"{a}-{b}")
-                elif (
-                    isinstance(parcial, (list, tuple))
-                    and len(parcial) >= 2
-                ):
-                    partes.append(
-                        f"{parcial[0]}-{parcial[1]}"
-                    )
-            placar = ", ".join(partes)
-
-    return {
-        "status": "FINISHED",
-        "winner_index": vencedor_indice,
-        "winner_name": (
-            nome1 if vencedor_indice == 0 else nome2
-        ),
-        "placar": placar,
-    }
-
-
+    indice = 0 if _normalizar_nome_tenis(nome_vencedor) == _normalizar_nome_tenis(nome1) else 1
+    return {"status": "FINISHED", "winner_index": indice,
+            "winner_name": nome_vencedor, "placar": str(item["result"])}
 
 
 # =========================================================
@@ -3145,10 +2411,10 @@ def atualizar_resultados_automaticamente():
         if modalidade == "MMA" or fonte in {"api_mma", "ufcalendar"}:
             if jogo_comecou(p):
                 pendentes_mma.append(p)
-        elif modalidade == "Ténis" or fonte == "api_tennis":
+        elif modalidade == "Ténis" or fonte in {"api_tennis", "tennis_rapidapi_atp", "tennis_rapidapi_wta"}:
             # Só consultar a API depois da hora prevista do encontro,
             # para poupar o limite mensal.
-            if jogo_comecou(p):
+            if fonte in {"tennis_rapidapi_atp", "tennis_rapidapi_wta"} and jogo_comecou(p):
                 pendentes_tenis.append(p)
         elif (
             fonte == "rapidapi_brasileirao"
@@ -3226,9 +2492,13 @@ def atualizar_resultados_automaticamente():
             atualizados += 1
 
     # Ténis
-    for previsao in pendentes_tenis:
+    # Limitar consultas por execução para proteger a quota gratuita.
+    for previsao in pendentes_tenis[:4]:
         resultado = buscar_resultado_tenis(
-            previsao.get("evento_id")
+            previsao.get("evento_id"),
+            "WTA" if previsao.get("fonte_api") == "tennis_rapidapi_wta" else "ATP",
+            previsao.get("casa") or "",
+            previsao.get("fora") or "",
         )
 
         if not resultado:
@@ -4006,8 +3276,6 @@ with tab_prever:
 
         with st.spinner("A carregar encontros de ténis..."):
             jogos_tenis, erro_tenis, diag_tenis = buscar_jogos_tenis(circuito)
-            aviso_complementar = None
-            jogos_tenis, aviso_complementar, diag_complementar = completar_horarios_tenis(jogos_tenis, circuito)
 
         if erro_tenis:
             if "limitar pedidos" in erro_tenis.lower():
@@ -4019,13 +3287,10 @@ with tab_prever:
                 st.error(erro_tenis)
             jogos_tenis = []
 
-        if jogos_tenis and aviso_complementar:
-            st.caption("Calendário complementar indisponível; horários originais mantidos.")
-
-        with st.expander("🔧 Estado do calendário complementar (sem mostrar a chave)"):
-            st.json(diag_complementar)
-            if aviso_complementar:
-                st.warning(aviso_complementar)
+        st.caption("A partir desta versão, as novas previsões de ténis usam uma única API. "
+                   "As previsões antigas continuam no histórico e não são recalculadas automaticamente nesta migração.")
+        with st.expander("🔧 Diagnóstico do calendário ATP/WTA"):
+            st.json(diag_tenis)
 
         if not jogos_tenis and not erro_tenis:
             st.info(
@@ -4059,13 +3324,7 @@ with tab_prever:
                 st.caption(f"✅ {aviso_horario}")
             else:
                 st.warning(f"🔒 {aviso_horario}")
-            if jogo.get("horario_previsto"):
-                st.caption(
-                    "🕒 Data/hora prevista pelo calendário complementar; "
-                    "não é confirmação do início real."
-                )
-            elif not jogo.get("hora_confirmada"):
-                st.caption("A fonte atual só indica o dia; hora do encontro ainda por confirmar.")
+            st.caption("🕒 Horário previsto pela Tennis API; pode mudar conforme os encontros anteriores.")
             if "paris" in jogo.get("liga", "").lower():
                 st.caption("O horário previsto de cada encontro deve ser confirmado na ordem de jogos oficial, não na hora de abertura da sessão.")
                 st.markdown("[Consultar programação oficial do Rolex Paris Masters](https://tickets.rolexparismasters.com/en/programme-previsionnel)")
@@ -4165,7 +3424,7 @@ with tab_prever:
                         "match_id":
                             None,
                         "fonte_api":
-                            "api_tennis",
+                            "tennis_rapidapi_wta" if circuito == "WTA" else "tennis_rapidapi_atp",
                         "jogo":
                             jogo["jogo"],
                         "casa":
