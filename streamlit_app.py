@@ -5,7 +5,7 @@ import unicodedata
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from collections import defaultdict, Counter
-from st_cookie_manager import EncryptedCookieManager
+
 
 # =========================================================
 # CONFIGURAÇÃO
@@ -28,13 +28,33 @@ UFC_API_KEY = st.secrets.get("UFC_API_KEY", "")
 
 # Cookie encriptado para manter a sessão iniciada entre visitas.
 # A chave privada do servidor é usada apenas como palavra-passe de encriptação.
-cookies = EncryptedCookieManager(
-    prefix="previsoes_futebol/",
-    password=SUPABASE_SECRET_KEY,
-)
+# Sessão temporária do Streamlit: sem componente externo de cookies.
+# Nota: a sessão não persiste depois de fechar/recarregar a página.
+class SessionCookies:
+    def __init__(self):
+        if "_cookies_temporarios" not in st.session_state:
+            st.session_state["_cookies_temporarios"] = {}
 
-if not cookies.ready():
-    st.stop()
+    def get(self, chave, default=None):
+        return st.session_state["_cookies_temporarios"].get(chave, default)
+
+    def __getitem__(self, chave):
+        return st.session_state["_cookies_temporarios"][chave]
+
+    def __setitem__(self, chave, valor):
+        st.session_state["_cookies_temporarios"][chave] = valor
+
+    def __contains__(self, chave):
+        return chave in st.session_state["_cookies_temporarios"]
+
+    def __delitem__(self, chave):
+        st.session_state["_cookies_temporarios"].pop(chave, None)
+
+    def save(self):
+        pass
+
+
+cookies = SessionCookies()
 
 TZ = ZoneInfo("Europe/Lisbon")
 
