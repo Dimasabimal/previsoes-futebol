@@ -1,0 +1,38 @@
+name: Atualizar resultados das previsoes
+
+on:
+  schedule:
+    # Quatro execucoes diarias em UTC; nao depende do site estar aberto.
+    - cron: "17 0,6,12,18 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: atualizacao-resultados
+  cancel-in-progress: false
+
+jobs:
+  atualizar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Obter codigo
+        uses: actions/checkout@v4
+      - name: Preparar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Instalar dependencias
+        run: python -m pip install "requests>=2.31,<3"
+      - name: Verificar e atualizar resultados
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+          FOOTBALL_API_KEY: ${{ secrets.FOOTBALL_API_KEY }}
+          TENNIS_SCHEDULE_API_KEY: ${{ secrets.TENNIS_SCHEDULE_API_KEY }}
+          BRASILEIRAO_API_KEY: ${{ secrets.BRASILEIRAO_API_KEY }}
+          API_NINJAS_KEY: ${{ secrets.API_NINJAS_KEY }}
+          UFC_API_KEY: ${{ secrets.UFC_API_KEY }}
+        run: python scripts/atualizar_resultados.py
