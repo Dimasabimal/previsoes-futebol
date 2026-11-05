@@ -2132,34 +2132,78 @@ def dificuldade_tenis(jogo, valor):
     return "Muito difícil", 3.0
 
 
-@st.cache_data(ttl=7200, show_spinner=False)
-def buscar_resultado_tenis(evento_id, circuito="ATP", nome1="", nome2=""):
-    """Usa o ID estável do mesmo fornecedor. Nunca assume vencedor por posição
-    enquanto o jogo não constar no arquivo de resultados completos."""
-    if not evento_id or not TENNIS_SCHEDULE_API_KEY:
+@st.cache_data(ttl=1200, show_spinner=False)
+def _resultados_tenis_por_dia(tour, dia):
+    # Rota de resultados oficialmente documentada pelo fornecedor.
+    payload, erro = _pedido_tenis_rapidapi(
+        f"/{tour}/results/{dia}", {"filter": "PlayerGroup:singles", "pageSize": 500}
+    )
+    if erro:
+        return [], erro
+    lista = payload.get("data", []) if isinstance(payload, dict) else []
+    if isinstance(lista, list):
+        return lista, None
+    return [], "A API de ténis devolveu um formato inesperado."
+
+
+def _chave_partida_tenis(row):
+    """Compara IDs de jogadores ignorando a ordem vencedor/perdedor."""
+    if not isinstance(row, dict):
+        return None
+    raw = row.get("liveMatchId") or row.get("matchKey") or ""
+    partes = str(raw).split("-")
+    if len(partes) == 4 and all(partes):
+        return (tuple(sorted(partes[:2])), partes[2], partes[3])
+    p1 = row.get("player1Id") or (row.get("player1") or {}).get("id")
+    p2 = row.get("player2Id") or (row.get("player2") or {}).get("id")
+    torneio = row.get("tournamentId") or (row.get("tournament") or {}).get("id")
+    ronda = row.get("roundId")
+    if all(x is not None for x in (p1, p2, torneio, ronda)):
+        return (tuple(sorted([str(p1), str(p2)])), str(torneio), str(ronda))
+    return None
+
+
+def buscar_resultado_tenis(evento_id, circuito="ATP", nome1="", nome2="", data_jogo=None):
+    if not evento_id or not TENNIS_SCHEDULE_API_KEY or not data_jogo:
+        return None
+    dt = parse_data_jogo(data_jogo)
+    if not dt:
         return None
     tour = "wta" if str(circuito).upper() == "WTA" else "atp"
-    payload, erro = _pedido_tenis_rapidapi(
-        f"/matches/{evento_id}", {"type": tour, "source": "game"}
-    )
-    if erro or not payload:
+    lista, erro = _resultados_tenis_por_dia(tour, dt.date().isoformat())
+    if erro:
+        st.session_state.setdefault("erros_verificacao", []).append(erro)
         return None
-    item = _dados_tenis_resposta(payload)
-    if item.get("source") != "game" or not item.get("result"):
+    chave_alvo = _chave_partida_tenis({"liveMatchId": str(evento_id)})
+    nomes_alvo = {
+        _normalizar_nome_tenis(nome1), _normalizar_nome_tenis(nome2)
+    }
+    encontrados = []
+    for row in lista:
+        if not isinstance(row, dict) or not row.get("result"):
+            continue
+        primeiro = row.get("player1") or {}
+        segundo = row.get("player2") or {}
+        if not isinstance(primeiro, dict) or not isinstance(segundo, dict):
+            continue
+        n1 = _normalizar_nome_tenis(primeiro.get("name"))
+        n2 = _normalizar_nome_tenis(segundo.get("name"))
+        if not n1 or not n2 or {n1, n2} != nomes_alvo:
+            continue
+        chave_row = _chave_partida_tenis(row)
+        # Se ambos os IDs estáveis estiverem disponíveis têm de coincidir.
+        if chave_alvo and chave_row and chave_alvo != chave_row:
+            continue
+        encontrados.append(row)
+    if len(encontrados) != 1:
         return {"status": "PENDING"}
-    vencedor = item.get("player1") or {}
-    perdedor = item.get("player2") or {}
-    if not isinstance(vencedor, dict) or not isinstance(perdedor, dict):
-        return None
-    nome_vencedor = vencedor.get("name") or ""
-    nome_perdedor = perdedor.get("name") or ""
-    nomes_registados = {_normalizar_nome_tenis(nome1), _normalizar_nome_tenis(nome2)}
-    nomes_api = {_normalizar_nome_tenis(nome_vencedor), _normalizar_nome_tenis(nome_perdedor)}
-    if not all(nomes_registados) or nomes_api != nomes_registados:
-        return None
+    row = encontrados[0]
+    nome_vencedor = (row.get("player1") or {}).get("name") or ""
     indice = 0 if _normalizar_nome_tenis(nome_vencedor) == _normalizar_nome_tenis(nome1) else 1
-    return {"status": "FINISHED", "winner_index": indice,
-            "winner_name": nome_vencedor, "placar": str(item["result"])}
+    return {
+        "status": "FINISHED", "winner_index": indice,
+        "winner_name": nome_vencedor, "placar": str(row["result"])
+    }
 
 
 # =========================================================
@@ -2554,26 +2598,32 @@ def carregar_pendentes_admin():
 
 
 def buscar_resultados_api(match_ids):
+    """Verifica todos os jogos num único pedido (rota oficial /v4/matches?ids=)."""
     resultados = {}
-    headers = {"X-Auth-Token": FOOTBALL_API_KEY}
-
-    for match_id in match_ids:
-        url = (
-            "https://api.football-data.org/"
-            f"v4/matches/{match_id}"
+    if not match_ids:
+        return resultados
+    ids = sorted({str(m) for m in match_ids if m is not None})
+    try:
+        r = requests.get(
+            "https://api.football-data.org/v4/matches",
+            headers={"X-Auth-Token": FOOTBALL_API_KEY},
+            params={"ids": ",".join(ids)},
+            timeout=18,
         )
-        try:
-            r = requests.get(
-                url,
-                headers=headers,
-                timeout=20,
+        if r.status_code != 200:
+            st.session_state.setdefault("erros_verificacao", []).append(
+                f"Champions League e restantes ligas: HTTP {r.status_code} "
+                "na consulta de resultados."
             )
-            if r.status_code == 200:
-                partida = r.json()
+            return resultados
+        payload = r.json()
+        for partida in payload.get("matches", []):
+            if isinstance(partida, dict) and partida.get("id") is not None:
                 resultados[partida["id"]] = partida
-        except requests.RequestException:
-            continue
-
+    except (requests.RequestException, ValueError, TypeError):
+        st.session_state.setdefault("erros_verificacao", []).append(
+            "Não foi possível obter os resultados da API de futebol."
+        )
     return resultados
 
 
@@ -2727,6 +2777,7 @@ def avaliar_previsao(previsao, partida):
 
 
 def atualizar_resultados_automaticamente():
+    st.session_state["erros_verificacao"] = []
     pendentes = carregar_pendentes_admin()
     if not pendentes:
         return 0
@@ -2785,6 +2836,16 @@ def atualizar_resultados_automaticamente():
     resultados_fd = buscar_resultados_api(
         ids_football_data
     )
+    st.session_state["diagnostico_resultados"] = {
+        "Futebol (jogos consultados)": len(ids_football_data),
+        "Futebol (jogos encontrados)": len(resultados_fd),
+        "Futebol (jogos finalizados)": sum(
+            1 for p in resultados_fd.values()
+            if p.get("status") == "FINISHED"
+        ),
+        "Ténis (previsões a verificar)": len(pendentes_tenis),
+        "Brasileirão (jogos a verificar)": len(ids_brasileirao),
+    }
 
     resultados_br = buscar_resultados_brasileirao(
         ids_brasileirao
@@ -2850,6 +2911,7 @@ def atualizar_resultados_automaticamente():
             "WTA" if previsao.get("fonte_api") == "tennis_rapidapi_wta" else "ATP",
             previsao.get("casa") or "",
             previsao.get("fora") or "",
+            previsao.get("data"),
         )
 
         if not resultado:
@@ -3565,8 +3627,17 @@ with st.sidebar:
             try:
                 n_atualizados = atualizar_resultados_automaticamente()
                 st.success(f"{n_atualizados} previsões atualizadas.")
-            except Exception:
-                st.error("Não foi possível concluir a verificação de resultados.")
+            except Exception as erro:
+                st.error(f"Falha na verificação: {type(erro).__name__}.")
+    with st.expander("🔎 Diagnóstico da última verificação"):
+        diagnostico = st.session_state.get("diagnostico_resultados", {})
+        if diagnostico:
+            for chave, numero in diagnostico.items():
+                st.write(f"{chave}: **{numero}**")
+        else:
+            st.caption("Carrega no botão acima para consultar os resultados.")
+        for erro in st.session_state.get("erros_verificacao", []):
+            st.warning(erro)
 
 previsoes = carregar_previsoes()
 
