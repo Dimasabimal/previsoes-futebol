@@ -103,12 +103,12 @@ def goals(partida):
 def threshold(actual, value):
     if str(value) == "0":
         return actual == 0
-    try:
-        digits = re.findall(r"\d+", str(value))
-        return bool(digits) and actual >= int(digits[-1])
-    except (ValueError, TypeError):
-        return False
-
+    if isinstance(value, str) and value.endswith("+"):
+        try:
+            return actual >= int(value[:-1])
+        except ValueError:
+            return False
+    return False
 
 def assess_football(prediction, partida):
     h, a, hh, ha = goals(partida)
