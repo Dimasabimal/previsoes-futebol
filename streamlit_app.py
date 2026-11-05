@@ -1672,28 +1672,22 @@ def buscar_perfil_golos_liga(nome_liga):
 
 
 def dificuldade_por_probabilidade(probabilidade):
-    """
-    Converte uma frequência estimada (0 a 1) em dificuldade.
-
-    70%+   -> Fácil x1
-    55-69% -> Média x1.5
-    35-54% -> Difícil x2
-    <35%   -> Muito difícil x3
-    """
+    """Sete níveis de dificuldade usando frequência estimada."""
     if probabilidade is None:
         return "Média", 1.5
-
+    if probabilidade >= 0.90:
+        return "Extremamente fácil", 0.75
+    if probabilidade >= 0.80:
+        return "Muito fácil", 1.0
     if probabilidade >= 0.70:
-        return "Fácil", 1.0
-
+        return "Fácil", 1.25
     if probabilidade >= 0.55:
         return "Média", 1.5
-
-    if probabilidade >= 0.35:
+    if probabilidade >= 0.40:
         return "Difícil", 2.0
-
-    return "Muito difícil", 3.0
-
+    if probabilidade >= 0.25:
+        return "Muito difícil", 2.5
+    return "Extremamente difícil", 3.0
 
 def frequencia_evento(lista, funcao):
     valores = []
@@ -1765,29 +1759,38 @@ def dificuldade_previsao(
             else:
                 delta = pf - pc
 
+            if delta <= -15:
+                return "Extremamente fácil", 0.75
+            if delta <= -9:
+                return "Muito fácil", 1.0
             if delta <= -5:
-                return "Fácil", 1.0
-
+                return "Fácil", 1.25
             if delta <= 1:
                 return "Média", 1.5
-
             if delta <= 6:
                 return "Difícil", 2.0
-
-            return "Muito difícil", 3.0
+            if delta <= 12:
+                return "Muito difícil", 2.5
+            return "Extremamente difícil", 3.0
 
         if valor == "CasaEmpate":
             delta = pc - pf
         else:
             delta = pf - pc
 
+        if delta <= -15:
+            return "Extremamente fácil", 0.75
+        if delta <= -9:
+            return "Muito fácil", 1.0
         if delta <= -5:
-            return "Fácil", 1.0
-
+            return "Fácil", 1.25
         if delta <= 2:
             return "Média", 1.5
-
-        return "Difícil", 2.0
+        if delta <= 7:
+            return "Difícil", 2.0
+        if delta <= 13:
+            return "Muito difícil", 2.5
+        return "Extremamente difícil", 3.0
 
     # =====================================================
     # MERCADOS DE GOLOS
@@ -2123,14 +2126,22 @@ def dificuldade_tenis(jogo, valor):
         return "Média", 1.5
     escolhido = rank1 if valor == "Jogador1" else rank2
     adversario = rank2 if valor == "Jogador1" else rank1
-    if escolhido <= max(10, adversario * .5):
-        return "Fácil", 1.0
-    if escolhido <= adversario * 1.15:
+    if escolhido <= 0 or adversario <= 0:
         return "Média", 1.5
-    if escolhido <= adversario * 2:
+    proporcao = escolhido / adversario
+    if proporcao <= 0.15:
+        return "Extremamente fácil", 0.75
+    if proporcao <= 0.35:
+        return "Muito fácil", 1.0
+    if proporcao <= 0.60:
+        return "Fácil", 1.25
+    if proporcao <= 1.15:
+        return "Média", 1.5
+    if proporcao <= 1.8:
         return "Difícil", 2.0
-    return "Muito difícil", 3.0
-
+    if proporcao <= 3.5:
+        return "Muito difícil", 2.5
+    return "Extremamente difícil", 3.0
 
 @st.cache_data(ttl=1200, show_spinner=False)
 def _resultados_tenis_por_dia(tour, dia):
@@ -2474,13 +2485,18 @@ def dificuldade_mma(luta, valor):
     elif diferenca_streak <= -4:
         score -= 1
 
+    if score >= 5:
+        return "Extremamente difícil", 3.0
     if score >= 4:
         return "Muito difícil", 2.5
     if score >= 2:
         return "Difícil", 2.0
+    if score <= -5:
+        return "Extremamente fácil", 0.75
+    if score <= -4:
+        return "Muito fácil", 1.0
     if score <= -2:
-        return "Fácil", 1.0
-
+        return "Fácil", 1.25
     return "Média", 1.5
 
 
