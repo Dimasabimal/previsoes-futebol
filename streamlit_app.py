@@ -3361,6 +3361,7 @@ def mostrar_estatisticas_completas(lista, prefixo=""):
             "Taxa": f"{e['taxa']:.1f}%",
             "Acertos": e["acertos"],
             "Erros": e["erros"],
+            "Concluídas": e["concluidas"],
             "Pendentes": e["pendentes"],
             "Pontos": e["pontos"],
             "_taxa": e["taxa"],
