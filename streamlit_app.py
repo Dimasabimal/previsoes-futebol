@@ -1672,20 +1672,28 @@ def buscar_perfil_golos_liga(nome_liga):
 
 
 def dificuldade_por_probabilidade(probabilidade):
-    """Sete níveis de dificuldade usando frequência estimada."""
+    """Onze níveis de dificuldade a partir da frequência estimada."""
     if probabilidade is None:
         return "Média", 1.5
-    if probabilidade >= 0.90:
+    if probabilidade >= 0.93:
         return "Extremamente fácil", 0.75
-    if probabilidade >= 0.80:
-        return "Muito fácil", 1.0
+    if probabilidade >= 0.85:
+        return "Muito fácil", 0.9
+    if probabilidade >= 0.78:
+        return "Bastante fácil", 1.0
     if probabilidade >= 0.70:
-        return "Fácil", 1.25
-    if probabilidade >= 0.55:
+        return "Fácil", 1.15
+    if probabilidade >= 0.62:
+        return "Ligeiramente fácil", 1.3
+    if probabilidade >= 0.52:
         return "Média", 1.5
-    if probabilidade >= 0.40:
+    if probabilidade >= 0.43:
+        return "Ligeiramente difícil", 1.7
+    if probabilidade >= 0.35:
         return "Difícil", 2.0
-    if probabilidade >= 0.25:
+    if probabilidade >= 0.27:
+        return "Bastante difícil", 2.25
+    if probabilidade >= 0.17:
         return "Muito difícil", 2.5
     return "Extremamente difícil", 3.0
 
@@ -1718,6 +1726,33 @@ def media_probabilidades(*valores):
         return None
 
     return sum(validos) / len(validos)
+
+
+def dificuldade_por_delta_ranking(delta, dupla=False):
+    """Distingue diferenças na classificação sem alterar previsões antigas."""
+    # Dupla possibilidade é avaliada com margens ligeiramente diferentes.
+    margens = (
+        (-16, -12, -9, -6, -3, 2, 4, 7, 10, 14)
+        if dupla else
+        (-16, -12, -9, -6, -3, 1, 3, 6, 9, 13)
+    )
+    niveis = [
+        ("Extremamente fácil", 0.75),
+        ("Muito fácil", 0.9),
+        ("Bastante fácil", 1.0),
+        ("Fácil", 1.15),
+        ("Ligeiramente fácil", 1.3),
+        ("Média", 1.5),
+        ("Ligeiramente difícil", 1.7),
+        ("Difícil", 2.0),
+        ("Bastante difícil", 2.25),
+        ("Muito difícil", 2.5),
+        ("Extremamente difícil", 3.0),
+    ]
+    for limite, nivel in zip(margens, niveis):
+        if delta <= limite:
+            return nivel
+    return niveis[-1]
 
 
 def dificuldade_previsao(
@@ -1758,39 +1793,13 @@ def dificuldade_previsao(
                 delta = pc - pf
             else:
                 delta = pf - pc
-
-            if delta <= -15:
-                return "Extremamente fácil", 0.75
-            if delta <= -9:
-                return "Muito fácil", 1.0
-            if delta <= -5:
-                return "Fácil", 1.25
-            if delta <= 1:
-                return "Média", 1.5
-            if delta <= 6:
-                return "Difícil", 2.0
-            if delta <= 12:
-                return "Muito difícil", 2.5
-            return "Extremamente difícil", 3.0
+            return dificuldade_por_delta_ranking(delta)
 
         if valor == "CasaEmpate":
             delta = pc - pf
         else:
             delta = pf - pc
-
-        if delta <= -15:
-            return "Extremamente fácil", 0.75
-        if delta <= -9:
-            return "Muito fácil", 1.0
-        if delta <= -5:
-            return "Fácil", 1.25
-        if delta <= 2:
-            return "Média", 1.5
-        if delta <= 7:
-            return "Difícil", 2.0
-        if delta <= 13:
-            return "Muito difícil", 2.5
-        return "Extremamente difícil", 3.0
+        return dificuldade_por_delta_ranking(delta, dupla=True)
 
     # =====================================================
     # MERCADOS DE GOLOS
@@ -2128,18 +2137,27 @@ def dificuldade_tenis(jogo, valor):
     adversario = rank2 if valor == "Jogador1" else rank1
     if escolhido <= 0 or adversario <= 0:
         return "Média", 1.5
+    # A razão entre rankings é um indicador, não uma probabilidade.
     proporcao = escolhido / adversario
-    if proporcao <= 0.15:
+    if proporcao <= 0.12:
         return "Extremamente fácil", 0.75
-    if proporcao <= 0.35:
-        return "Muito fácil", 1.0
-    if proporcao <= 0.60:
-        return "Fácil", 1.25
+    if proporcao <= 0.22:
+        return "Muito fácil", 0.9
+    if proporcao <= 0.36:
+        return "Bastante fácil", 1.0
+    if proporcao <= 0.58:
+        return "Fácil", 1.15
+    if proporcao <= 0.78:
+        return "Ligeiramente fácil", 1.3
     if proporcao <= 1.15:
         return "Média", 1.5
-    if proporcao <= 1.8:
+    if proporcao <= 1.50:
+        return "Ligeiramente difícil", 1.7
+    if proporcao <= 2.0:
         return "Difícil", 2.0
-    if proporcao <= 3.5:
+    if proporcao <= 3.0:
+        return "Bastante difícil", 2.25
+    if proporcao <= 5.0:
         return "Muito difícil", 2.5
     return "Extremamente difícil", 3.0
 
@@ -2485,19 +2503,27 @@ def dificuldade_mma(luta, valor):
     elif diferenca_streak <= -4:
         score -= 1
 
-    if score >= 5:
+    if score >= 6:
         return "Extremamente difícil", 3.0
-    if score >= 4:
+    if score >= 5:
         return "Muito difícil", 2.5
-    if score >= 2:
+    if score >= 4:
+        return "Bastante difícil", 2.25
+    if score >= 3:
         return "Difícil", 2.0
-    if score <= -5:
-        return "Extremamente fácil", 0.75
-    if score <= -4:
-        return "Muito fácil", 1.0
-    if score <= -2:
-        return "Fácil", 1.25
-    return "Média", 1.5
+    if score >= 2:
+        return "Ligeiramente difícil", 1.7
+    if score >= 0:
+        return "Média", 1.5
+    if score >= -1:
+        return "Ligeiramente fácil", 1.3
+    if score >= -2:
+        return "Fácil", 1.15
+    if score >= -3:
+        return "Bastante fácil", 1.0
+    if score >= -4:
+        return "Muito fácil", 0.9
+    return "Extremamente fácil", 0.75
 
 
 
