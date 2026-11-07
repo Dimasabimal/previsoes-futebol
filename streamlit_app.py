@@ -1755,6 +1755,37 @@ def dificuldade_por_delta_ranking(delta, dupla=False):
     return niveis[-1]
 
 
+def ajustar_dificuldade_dupla(dificuldade, multiplicador):
+    """Dupla possibilidade: acerta com dois resultados, por isso pontua menos.
+
+    Dois escalões mais fáceis que a previsão simples comparável.
+    Nos escalões mínimos usa um multiplicador próprio para garantir
+    sempre uma diferença entre escolha simples e dupla.
+    """
+    niveis = [
+        ("Extremamente fácil", 0.75),
+        ("Muito fácil", 0.9),
+        ("Bastante fácil", 1.0),
+        ("Fácil", 1.15),
+        ("Ligeiramente fácil", 1.3),
+        ("Média", 1.5),
+        ("Ligeiramente difícil", 1.7),
+        ("Difícil", 2.0),
+        ("Bastante difícil", 2.25),
+        ("Muito difícil", 2.5),
+        ("Extremamente difícil", 3.0),
+    ]
+    idx = next(
+        (i for i, (nome, _) in enumerate(niveis) if nome == dificuldade),
+        5,
+    )
+    if idx == 0:
+        return "Extremamente fácil", 0.55
+    if idx == 1:
+        return "Extremamente fácil", 0.65
+    return niveis[max(0, idx - 2)]
+
+
 def dificuldade_previsao(
     tipo,
     valor,
@@ -1783,9 +1814,11 @@ def dificuldade_previsao(
             tipo == "dupla_possibilidade"
             and valor == "CasaFora"
         ):
-            return "Média", 1.5
+            return ajustar_dificuldade_dupla("Média", 1.5)
 
         if not pc or not pf:
+            if tipo == "dupla_possibilidade":
+                return ajustar_dificuldade_dupla("Média", 1.5)
             return "Média", 1.5
 
         if tipo == "resultado":
@@ -1799,7 +1832,8 @@ def dificuldade_previsao(
             delta = pc - pf
         else:
             delta = pf - pc
-        return dificuldade_por_delta_ranking(delta, dupla=True)
+        dificuldade, multiplicador = dificuldade_por_delta_ranking(delta)
+        return ajustar_dificuldade_dupla(dificuldade, multiplicador)
 
     # =====================================================
     # MERCADOS DE GOLOS
