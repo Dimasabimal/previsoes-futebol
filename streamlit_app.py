@@ -1786,6 +1786,111 @@ def ajustar_dificuldade_dupla(dificuldade, multiplicador):
     return niveis[max(0, idx - 2)]
 
 
+# Escala detalhada de pontos do jogo (não são probabilidades oficiais).
+ESCALA_DIFICULDADE_GOL = [
+    ("Extremamente fácil", 0.75),
+    ("Muito fácil", 0.90),
+    ("Bastante fácil", 1.00),
+    ("Fácil", 1.15),
+    ("Ligeiramente fácil", 1.30),
+    ("Média", 1.50),
+    ("Ligeiramente difícil", 1.70),
+    ("Difícil", 2.00),
+    ("Bastante difícil", 2.25),
+    ("Muito difícil", 2.50),
+    ("Extremamente difícil", 3.00),
+]
+
+# Valores iniciais heurísticos; os últimos jogos disponíveis refinam-nos.
+# Não são taxas oficiais nem garantias de ocorrência.
+REFERENCIAS_GOL = {
+    "golos_tempo_regulamentar": {
+        "0": 0.07, "1+": 0.93, "2+": 0.75,
+        "3+": 0.50, "4+": 0.29, "5+": 0.15,
+    },
+    "golos_intervalo": {
+        "0": 0.36, "1+": 0.64, "2+": 0.29, "3+": 0.10,
+    },
+    "golos_equipa": {
+        "0": 0.29, "1+": 0.71, "2+": 0.38,
+        "3+": 0.16, "4+": 0.06,
+    },
+}
+
+
+def dificuldade_previsao_golos(tipo, valor, jogos_casa, jogos_fora):
+    """Atribui dificuldade própria a cada limiar de golos.
+
+    A estimativa combina uma referência neutra com resultados disponíveis.
+    Ao mapear as opções para os onze níveis, evita rótulos e pontuações
+    repetidos dentro da mesma categoria (0, 1+, 2+, 3+...).
+    """
+    chave = (
+        "golos_equipa" if tipo in (
+            "golos_equipa_casa", "golos_equipa_fora"
+        ) else tipo
+    )
+    referencias = REFERENCIAS_GOL.get(chave)
+    if not referencias or valor not in referencias:
+        return "Média", 1.50
+
+    campo = (
+        "total" if tipo == "golos_tempo_regulamentar"
+        else "intervalo_total" if tipo == "golos_intervalo"
+        else "marcados"
+    )
+    if tipo == "golos_equipa_casa":
+        jogos = jogos_casa
+    elif tipo == "golos_equipa_fora":
+        jogos = jogos_fora
+    else:
+        jogos = list(jogos_casa) + list(jogos_fora)
+
+    amostra = []
+    for item in jogos:
+        numero = item.get(campo) if isinstance(item, dict) else None
+        if isinstance(numero, (int, float)) and numero >= 0:
+            amostra.append(numero)
+
+    estimativas = {}
+    peso_referencia = 8
+    for escolha, referencia in referencias.items():
+        limite = valor_minimo_golos(escolha)
+        acertos = sum(
+            (numero == 0) if escolha == "0" else (numero >= limite)
+            for numero in amostra
+        )
+        estimativas[escolha] = (
+            referencia * peso_referencia + acertos
+        ) / (peso_referencia + len(amostra))
+
+    # Índice 0 = mais fácil, 10 = mais difícil.
+    cortes = (0.93, 0.85, 0.78, 0.70, 0.62, 0.52,
+              0.43, 0.35, 0.27, 0.17)
+    opcoes = sorted(
+        referencias,
+        key=lambda escolha: (
+            -estimativas[escolha], -referencias[escolha], escolha
+        ),
+    )
+    ultimo_indice = -1
+    atribuidos = {}
+    for i, escolha in enumerate(opcoes):
+        probabilidade = estimativas[escolha]
+        ideal = next(
+            (j for j, corte in enumerate(cortes)
+             if probabilidade >= corte),
+            len(cortes),
+        )
+        # Reserva um escalão para cada escolha seguinte.
+        maximo = len(ESCALA_DIFICULDADE_GOL) - (len(opcoes) - i)
+        indice = min(max(ideal, ultimo_indice + 1), maximo)
+        atribuidos[escolha] = ESCALA_DIFICULDADE_GOL[indice]
+        ultimo_indice = indice
+
+    return atribuidos[valor]
+
+
 def dificuldade_previsao(
     tipo,
     valor,
@@ -1838,138 +1943,34 @@ def dificuldade_previsao(
     # =====================================================
     # MERCADOS DE GOLOS
     # =====================================================
-
     perfis_golos = perfis_golos or {}
-
     jogos_casa = perfis_golos.get(casa, [])
     jogos_fora = perfis_golos.get(fora, [])
 
-    # Se ainda não houver amostra suficiente, usamos Médio,
-    # em vez de marcar tudo automaticamente como Fácil.
-    if not jogos_casa and not jogos_fora:
-        return "Média", 1.5
-
     if tipo == "ambas_marcam":
         freq_casa = frequencia_evento(
-            jogos_casa,
-            lambda x: x.get("ambas"),
+            jogos_casa, lambda x: x.get("ambas")
         )
-
         freq_fora = frequencia_evento(
-            jogos_fora,
-            lambda x: x.get("ambas"),
+            jogos_fora, lambda x: x.get("ambas")
         )
-
-        prob_sim = media_probabilidades(
-            freq_casa,
-            freq_fora,
-        )
-
+        prob_sim = media_probabilidades(freq_casa, freq_fora)
         if prob_sim is None:
             return "Média", 1.5
-
-        prob = (
-            prob_sim
-            if valor == "Sim"
-            else 1 - prob_sim
-        )
-
+        prob = prob_sim if valor == "Sim" else 1 - prob_sim
         return dificuldade_por_probabilidade(prob)
 
-    if tipo == "golos_tempo_regulamentar":
-        minimo = valor_minimo_golos(valor)
-
-        def evento_total(item):
-            total = item.get("total")
-
-            if total is None:
-                return None
-
-            if valor == "0":
-                return total == 0
-
-            return total >= minimo
-
-        freq_casa = frequencia_evento(
-            jogos_casa,
-            evento_total,
-        )
-
-        freq_fora = frequencia_evento(
-            jogos_fora,
-            evento_total,
-        )
-
-        return dificuldade_por_probabilidade(
-            media_probabilidades(
-                freq_casa,
-                freq_fora,
-            )
-        )
-
-    if tipo == "golos_intervalo":
-        minimo = valor_minimo_golos(valor)
-
-        def evento_intervalo(item):
-            total = item.get("intervalo_total")
-
-            if total is None:
-                return None
-
-            if valor == "0":
-                return total == 0
-
-            return total >= minimo
-
-        freq_casa = frequencia_evento(
-            jogos_casa,
-            evento_intervalo,
-        )
-
-        freq_fora = frequencia_evento(
-            jogos_fora,
-            evento_intervalo,
-        )
-
-        return dificuldade_por_probabilidade(
-            media_probabilidades(
-                freq_casa,
-                freq_fora,
-            )
-        )
-
-    if tipo in [
+    if tipo in (
+        "golos_tempo_regulamentar",
+        "golos_intervalo",
         "golos_equipa_casa",
         "golos_equipa_fora",
-    ]:
-        minimo = valor_minimo_golos(valor)
-
-        jogos_equipa = (
-            jogos_casa
-            if tipo == "golos_equipa_casa"
-            else jogos_fora
+    ):
+        return dificuldade_previsao_golos(
+            tipo, valor, jogos_casa, jogos_fora
         )
-
-        def evento_equipa(item):
-            marcados = item.get("marcados")
-
-            if marcados is None:
-                return None
-
-            if valor == "0":
-                return marcados == 0
-
-            return marcados >= minimo
-
-        prob = frequencia_evento(
-            jogos_equipa,
-            evento_equipa,
-        )
-
-        return dificuldade_por_probabilidade(prob)
 
     return "Média", 1.5
-
 
 
 # =========================================================
