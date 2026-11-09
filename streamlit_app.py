@@ -1,5 +1,6 @@
 import streamlit as st
 import requests
+from scripts.tenis_regras import avaliar_tenis
 import re
 import hashlib
 import unicodedata
@@ -82,6 +83,10 @@ NOMES_TIPOS = {
     "ambas_marcam": "Ambas as equipas marcam",
     "dupla_possibilidade": "Dupla possibilidade",
     "tenis_vencedor": "Vencedor do encontro",
+    "tenis_total_sets": "Número de sets (exato)",
+    "tenis_jogador_set": "Jogador ganha pelo menos 1 set",
+    "tenis_ambos_sets": "Ambos ganham pelo menos 1 set",
+    "tenis_total_jogos": "Total de jogos (games)",
     "mma_vencedor": "Vencedor da luta",
 }
 
@@ -1981,6 +1986,98 @@ TENNIS_SCHEDULE_HOST = "tennis-api-atp-wta-itf.p.rapidapi.com"
 TENNIS_RAPID_BASE = f"https://{TENNIS_SCHEDULE_HOST}/tennis/v2"
 
 
+def opcoes_tenis(tipo, jogo):
+    """Opções das previsões de ténis — pontos virtuais entre amigos."""
+    if tipo == "tenis_vencedor":
+        return {
+            jogo["casa"] + " vence": "Jogador1",
+            jogo["fora"] + " vence": "Jogador2",
+        }
+    if tipo == "tenis_total_sets":
+        liga = str(jogo.get("liga", "")).casefold()
+        grandes = ("australian open", "roland garros", "french open",
+                   "wimbledon", "us open", "usopen")
+        melhor_de_cinco = (
+            jogo.get("circuito") == "ATP"
+            and any(nome in liga for nome in grandes)
+        )
+        valores = (3, 4, 5) if melhor_de_cinco else (2, 3)
+        return {f"Exatamente {numero} sets": str(numero) for numero in valores}
+    if tipo == "tenis_jogador_set":
+        return {
+            jogo["casa"] + " ganha 1 ou mais sets": "Jogador1",
+            jogo["fora"] + " ganha 1 ou mais sets": "Jogador2",
+        }
+    if tipo == "tenis_ambos_sets":
+        return {"Sim": "Sim", "Não": "Não"}
+    if tipo == "tenis_total_jogos":
+        liga = str(jogo.get("liga", "")).casefold()
+        grandes = ("australian open", "roland garros", "french open",
+                   "wimbledon", "us open", "usopen")
+        maior = (
+            jogo.get("circuito") == "ATP"
+            and any(nome in liga for nome in grandes)
+        )
+        limiares = (24, 28, 32, 36, 40, 45, 50) if maior else (
+            18, 20, 22, 24, 26, 28, 30, 35
+        )
+        return {f"{n} ou mais jogos": f"{n}+" for n in limiares}
+    return {}
+
+
+def dificuldade_tenis_extra(tipo, valor, jogo):
+    """Níveis ilustrativos de desafio, não previsões de probabilidades reais."""
+    if tipo == "tenis_total_sets":
+        niveis = {
+            "2": ("Fácil", 1.15), "3": ("Difícil", 2.0),
+            "4": ("Bastante difícil", 2.25),
+            "5": ("Extremamente difícil", 3.0),
+        }
+        return niveis.get(valor, ("Média", 1.5))
+    if tipo == "tenis_jogador_set":
+        rank1 = jogo.get("rank_casa")
+        rank2 = jogo.get("rank_fora")
+        if not rank1 or not rank2:
+            return "Média", 1.5
+        escolhido = rank1 if valor == "Jogador1" else rank2
+        outro = rank2 if valor == "Jogador1" else rank1
+        proporcao = escolhido / outro
+        if proporcao < .35:
+            return "Muito fácil", .9
+        if proporcao < .80:
+            return "Fácil", 1.15
+        if proporcao < 1.7:
+            return "Média", 1.5
+        if proporcao < 3:
+            return "Difícil", 2.0
+        return "Muito difícil", 2.5
+    if tipo == "tenis_ambos_sets":
+        return ("Difícil", 2.0) if valor == "Sim" else ("Fácil", 1.15)
+    if tipo == "tenis_total_jogos":
+        try:
+            limiar = int(str(valor).rstrip("+"))
+        except ValueError:
+            return "Média", 1.5
+        liga = str(jogo.get("liga", "")).casefold()
+        grandes = ("australian open", "roland garros", "french open",
+                   "wimbledon", "us open", "usopen")
+        maior = jogo.get("circuito") == "ATP" and any(
+            nome in liga for nome in grandes
+        )
+        baixo, alto = (24, 50) if maior else (18, 35)
+        pos = (limiar - baixo) / max(1, alto - baixo)
+        niveis = [
+            ("Muito fácil", .9), ("Bastante fácil", 1.0),
+            ("Fácil", 1.15), ("Ligeiramente fácil", 1.3),
+            ("Média", 1.5), ("Ligeiramente difícil", 1.7),
+            ("Difícil", 2.0), ("Bastante difícil", 2.25),
+            ("Muito difícil", 2.5),
+        ]
+        indice = min(len(niveis)-1, max(0, round(pos * (len(niveis)-1))))
+        return niveis[indice]
+    return "Média", 1.5
+
+
 def _normalizar_nome_tenis(valor):
     txt = unicodedata.normalize("NFKD", str(valor or "").casefold())
     txt = "".join(c for c in txt if not unicodedata.combining(c))
@@ -2205,6 +2302,8 @@ def _resultados_tenis_por_dia(tour, dia):
     if erro:
         return [], erro
     lista = payload.get("data", []) if isinstance(payload, dict) else []
+    if isinstance(lista, dict):
+        lista = lista.get("singles", [])
     if isinstance(lista, list):
         return lista, None
     return [], "A API de ténis devolveu um formato inesperado."
@@ -2982,7 +3081,13 @@ def atualizar_resultados_automaticamente():
 
     # Ténis
     # Limitar consultas por execução para proteger a quota gratuita.
-    for previsao in pendentes_tenis[:4]:
+    eventos_vistos = set()
+    for previsao in pendentes_tenis:
+        chave_evento = previsao.get("evento_id")
+        if chave_evento not in eventos_vistos:
+            if len(eventos_vistos) >= 4:
+                break
+            eventos_vistos.add(chave_evento)
         resultado = buscar_resultado_tenis(
             previsao.get("evento_id"),
             "WTA" if previsao.get("fonte_api") == "tennis_rapidapi_wta" else "ATP",
@@ -2997,13 +3102,10 @@ def atualizar_resultados_automaticamente():
         if resultado.get("status") != "FINISHED":
             continue
 
-        valor = previsao.get("valor_previsao")
-        escolhido = 0 if valor == "Jogador1" else 1
-        acertou = escolhido == resultado.get("winner_index")
-
-        placar = resultado.get("placar") or ""
-        resultado_real = resultado.get("winner_name") or ""
-
+        avaliacao = avaliar_tenis(previsao, resultado)
+        if avaliacao is None:
+            continue
+        placar, resultado_real, acertou = avaliacao
         r = atualizar_previsao_admin(
             previsao["id"],
             placar,
@@ -3855,22 +3957,28 @@ if pagina_ativa == "⚽ Prever":
                 )
             ]
 
-            ja_tem = any(
-                p.get("tipo_previsao") == "tenis_vencedor"
-                for p in existentes
-            )
-
-            opcoes = opcoes_para_tipo(
+            tipos_tenis = [
                 "tenis_vencedor",
-                jogo,
+                "tenis_total_sets",
+                "tenis_jogador_set",
+                "tenis_ambos_sets",
+                "tenis_total_jogos",
+            ]
+            tipo = st.selectbox(
+                "Tipo de previsão",
+                tipos_tenis,
+                format_func=lambda item: NOMES_TIPOS[item],
+                key=f"tenis_tipo_{jogo['evento_id']}",
             )
-
+            ja_tem = any(
+                p.get("tipo_previsao") == tipo for p in existentes
+            )
+            opcoes = opcoes_tenis(tipo, jogo)
             label_valor = st.selectbox(
-                "Quem vence?",
+                "Escolha",
                 list(opcoes.keys()),
-                key=f"tenis_valor_{jogo['evento_id']}",
+                key=f"tenis_valor_{jogo['evento_id']}_{tipo}",
             )
-
             valor = opcoes[label_valor]
 
             confianca = st.select_slider(
@@ -3882,107 +3990,74 @@ if pagina_ativa == "⚽ Prever":
 
             dificuldade, multiplicador = (
                 dificuldade_tenis(jogo, valor)
+                if tipo == "tenis_vencedor"
+                else dificuldade_tenis_extra(tipo, valor, jogo)
             )
 
-            texto = texto_previsao(
-                "tenis_vencedor",
-                valor,
-                jogo,
-            )
-
-            rank1 = jogo.get("rank_casa")
-            rank2 = jogo.get("rank_fora")
-
-            detalhe_rank = ""
-            if rank1 and rank2:
-                detalhe_rank = (
-                    f"\n\nRanking: {jogo['casa']} #{rank1} • "
-                    f"{jogo['fora']} #{rank2}"
-                )
+            texto = label_valor
+            if tipo == "tenis_ambos_sets":
+                texto = "Ambos ganham pelo menos um set: " + valor
+            if tipo == "tenis_total_jogos":
+                st.caption("Jogos = games disputados em todos os sets. "
+                           "Não inclui pontos individuais.")
+            if tipo == "tenis_jogador_set":
+                st.caption("Um set ou mais, não exatamente um set.")
+            if tipo == "tenis_total_sets":
+                st.caption("Número exato de sets de um encontro concluído.")
 
             st.info(
                 f"🎯 {texto}\n\n"
                 f"Dificuldade: **{dificuldade} ×{multiplicador:g}** • "
                 f"Se acertar: **{formatar_pontos(confianca * multiplicador)} pontos** • "
                 f"Se errar: **-{confianca} pontos**"
-                f"{detalhe_rank}"
             )
+
+            if ja_tem:
+                st.warning("Já guardaste uma previsão desta categoria neste encontro.")
 
             if st.button(
                 "Guardar previsão de ténis",
                 type="primary",
                 key=f"guardar_tenis_{jogo['evento_id']}",
-                disabled=not previsao_aberta,
+                disabled=not previsao_aberta or ja_tem,
             ):
                 aberto_agora, motivo_agora = estado_previsao_tenis(jogo)
                 if not aberto_agora:
                     st.error(motivo_agora)
                 elif ja_tem:
-                    st.warning(
-                        "Já tens uma previsão para "
-                        "este encontro."
-                    )
+                    st.warning("Já tens uma previsão deste tipo neste encontro.")
                 else:
                     equipa_previsao = (
-                        jogo["casa"]
-                        if valor == "Jogador1"
-                        else jogo["fora"]
+                        jogo["casa"] if valor == "Jogador1"
+                        else jogo["fora"] if valor == "Jogador2"
+                        else None
                     )
-
                     registo = {
-                        "user_id":
-                            st.session_state["user_id"],
-                        "utilizador":
-                            st.session_state["nome"],
-                        "modalidade":
-                            "Ténis",
-                        "evento_id":
-                            jogo["evento_id"],
-                        "match_id":
-                            None,
-                        "fonte_api":
-                            "tennis_rapidapi_wta" if circuito == "WTA" else "tennis_rapidapi_atp",
-                        "jogo":
-                            jogo["jogo"],
-                        "casa":
-                            jogo["casa"],
-                        "fora":
-                            jogo["fora"],
-                        "liga":
-                            jogo["liga"],
-                        "data":
-                            jogo["data"],
-                        "previsao":
-                            texto,
-                        "tipo_previsao":
-                            "tenis_vencedor",
-                        "valor_previsao":
-                            valor,
-                        "equipa_previsao":
-                            equipa_previsao,
-                        "confianca":
-                            confianca,
-                        "dificuldade":
-                            dificuldade,
-                        "multiplicador":
-                            multiplicador,
-                        "placar":
-                            "",
-                        "resultado":
-                            "Pendente",
-                        "resultado_real":
-                            None,
+                        "user_id": st.session_state["user_id"],
+                        "utilizador": st.session_state["nome"],
+                        "modalidade": "Ténis",
+                        "evento_id": jogo["evento_id"],
+                        "match_id": None,
+                        "fonte_api": "tennis_rapidapi_wta" if circuito == "WTA" else "tennis_rapidapi_atp",
+                        "jogo": jogo["jogo"],
+                        "casa": jogo["casa"],
+                        "fora": jogo["fora"],
+                        "liga": jogo["liga"],
+                        "data": jogo["data"],
+                        "previsao": texto,
+                        "tipo_previsao": tipo,
+                        "valor_previsao": valor,
+                        "equipa_previsao": equipa_previsao,
+                        "confianca": confianca,
+                        "dificuldade": dificuldade,
+                        "multiplicador": multiplicador,
+                        "placar": "",
+                        "resultado": "Pendente",
+                        "resultado_real": None,
                     }
-
                     r = guardar_previsao(registo)
-
-                    if (
-                        r is not None
-                        and r.status_code in [200, 201]
-                    ):
-                        st.success(
-                            "✅ Previsão de ténis guardada!"
-                        )
+                    if r is not None and r.status_code in [200, 201]:
+                        st.success("✅ Previsão de ténis guardada!")
                         st.rerun()
                     else:
                         st.error("Não foi possível guardar a previsão de ténis.")
