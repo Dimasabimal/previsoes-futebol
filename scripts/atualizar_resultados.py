@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import requests
+from tenis_regras import avaliar_tenis
 
 TZ = ZoneInfo("Europe/Lisbon")
 SESSION = requests.Session()
@@ -312,15 +313,20 @@ def tennis(rows):
                 continue
             item = candidates[0]
             winner = (item.get("player1") or {}).get("name")
-            chosen = row.get("casa") if row.get("valor_previsao") == "Jogador1" else row.get("fora")
-            if not winner or not chosen:
+            if not winner:
                 continue
-            update_prediction(
-                row,
-                item["result"],
-                winner,
-                normalize(winner) == normalize(chosen),
+            indice = (
+                0 if normalize(winner) == normalize(row.get("casa"))
+                else 1
             )
+            resultado = {
+                "placar": str(item["result"]),
+                "winner_name": winner,
+                "winner_index": indice,
+            }
+            avaliacao = avaliar_tenis(row, resultado)
+            if avaliacao is not None:
+                update_prediction(row, *avaliacao)
 
 
 def ufc(rows):
