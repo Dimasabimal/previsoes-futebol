@@ -67,10 +67,12 @@ LIGAS = {
     "Premier League": "PL",
     "La Liga": "PD",
     "Serie A": "SA",
+    "Liga Francesa (Ligue 1)": "FL1",
     "Bundesliga": "BL1",
     "Champions League": "CL",
     "Liga Europa": "EL",
     "Conference League": "UCL",
+    "Liga das Nações (UEFA)": "API_NINJAS_UNL",
     "Brasileirão Série A": "API_FOOTBALL_BR",
 }
 
@@ -684,7 +686,7 @@ BRASILEIRAO_RAPIDAPI_BASE = (
 def fonte_api_liga(nome_liga):
     if nome_liga == "Brasileirão Série A":
         return "rapidapi_brasileirao"
-    if nome_liga in {"Liga Europa", "Conference League"}:
+    if nome_liga in {"Liga Europa", "Conference League", "Liga das Nações (UEFA)"}:
         return "api_ninjas_football"
     return "football_data"
 
@@ -1132,6 +1134,7 @@ def buscar_resultados_brasileirao(match_ids):
 API_NINJAS_COMPETICOES = {
     "Liga Europa": "uel",
     "Conference League": "uecl",
+    "Liga das Nações (UEFA)": "nationsleague",
 }
 API_NINJAS_URL = "https://api.api-ninjas.com/v1/soccermatches"
 
@@ -1531,7 +1534,7 @@ def buscar_jogos(nome_liga):
 @st.cache_data(ttl=300, show_spinner=False)
 @st.cache_data(ttl=600, show_spinner=False)
 def buscar_classificacao(nome_liga):
-    if nome_liga in API_SPORTS_COMPETICOES:
+    if nome_liga in API_NINJAS_COMPETICOES or nome_liga in API_SPORTS_COMPETICOES:
         return {}
     if nome_liga == "Brasileirão Série A":
         return buscar_classificacao_brasileirao()
@@ -1571,7 +1574,7 @@ def buscar_classificacao(nome_liga):
 
 @st.cache_data(ttl=600, show_spinner=False)
 def buscar_perfil_golos_liga(nome_liga):
-    if nome_liga in API_SPORTS_COMPETICOES:
+    if nome_liga in API_NINJAS_COMPETICOES or nome_liga in API_SPORTS_COMPETICOES:
         return {}
     if nome_liga == "Brasileirão Série A":
         return buscar_perfil_golos_brasileirao()
