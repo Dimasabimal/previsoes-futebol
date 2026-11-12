@@ -229,12 +229,18 @@ def ninjas(rows):
             params={"game_id": game_id},
         )
         if not isinstance(data, list):
+            print(f"API Ninjas: resposta indisponível para {game_id}")
             continue
         item = next(
             (r for r in data if str(r.get("game_id")) == str(game_id)),
             None,
         )
-        if not item or item.get("status") != "final":
+        if not item:
+            print(f"API Ninjas: encontro {game_id} não encontrado")
+            continue
+        status = str(item.get("status") or "desconhecido").lower()
+        print(f"API Ninjas: {game_id}, estado={status}")
+        if status != "final":
             continue
         # Não corrigir resultados de prolongamento/penáltis sem golos aos 90'.
         if item.get("decided_in") in ("extra_time", "penalties"):
