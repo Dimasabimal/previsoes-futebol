@@ -2,8 +2,11 @@ name: Atualizar resultados das previsoes
 
 on:
   schedule:
-    # Quatro execucoes diarias em UTC; nao depende do site estar aberto.
+    # Verificacoes de rotina; UTC (Portugal no inverno).
     - cron: "17 0,6,12,18 * * *"
+    # Resultados europeus: verificar de hora a hora entre as 19h e as 23h UTC.
+    # O GitHub pode atrasar a execucao alguns minutos.
+    - cron: "17 19-23 * * *"
   workflow_dispatch:
 
 permissions:
